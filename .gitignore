@@ -1,0 +1,15 @@
+# Reference work from another participant (public on their GitHub)
+ref-infraax/
+
+# Files distributed by the challenge organizers via `okc init`
+*/baseline.py
+*/reference.py
+*/checks.py
+*/TASK.md
+*/AGENTS.md
+*/submission.py
+
+# Run artifacts
+*/profiles/
+__pycache__/
+okc-install.sh
