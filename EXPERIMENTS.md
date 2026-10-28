@@ -29,3 +29,11 @@ Every judge run, with the hypothesis and the measured result. Times in µs; "ver
 - Triton FP8 P.V: the FP32 accumulator layout of an FP8 MMA differs from the FP8 A-operand layout; Triton routes P through shared memory every tile. Same in Gluon (convert_layout). FA3 uses in-register byte permutes.
 - Time twins (a copy of the kernel with one cost removed) inside one check run answer "which part is the bottleneck" for one check.
 - In a warp-specialized ring, a consumer that keeps tile i-1 while waiting for tile i needs the producer to run one tile less ahead, or it deadlocks.
+
+## Other problems (first board entries, 2026-10-28)
+
+| problem | file | job | result |
+|---|---|---|---|
+| muse_decode_layer | sub_v1.py (infraax sonnet_v5f) | 198ce00e37d742d4 | 1.429x, 13/13 tests |
+| muse_moe_w4a16 | sub_v1.py (infraax sonnet_v5) | e65993b3c77c4052 | 1.480x, 5/5 tests |
+| muse_bf16_proj | sub_v1.py (infraax director_v2) | d4d1752631d84ec3 | 1.171x, 9/9 tests |
