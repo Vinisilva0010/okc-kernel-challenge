@@ -132,3 +132,12 @@ verify32: RING4 1.34, G4P2 1.46, G3P2 1.47, G3P4 1.51.  decode32: RING4 2.17, G3
 Reading: batching P steps per wait/commit: +13% at verify16 vs same-run RING4 (+6% vs the earlier 2.00), +13% verify32, +12% decode32; larger P better. Epilogue (atomics) costs ~0
 (NOEPI == RING4) and KS multiplier is flat -> wave quantization/epilogue are not limiters. Idea 5 (plain stores) dropped.
 Next (check 3, v5): sweep P further (G2P4, G4P4, G2P8, G3P8) and G3P4 with __launch_bounds__(128,5), control RING4 in-run. Expect G3P8/G2P8 2.2-2.3 if lds->dq latency is the issue; flat -> issue-bound.
+RESULT job 750936fa4fd347e4 (official 5/5, 1.475x v1 path). regs: RING4 103, G3P4 121, G2P4 123, G4P4 120, G2P8 152, G3P8 168, G3P4_MB5 96 (local 0).
+verify16 TB/s: RING4 1.87, G3P4 2.11, G2P4 2.20 (206us), G4P4 2.12, G2P8 2.13, G3P8 2.01, G3P4_MB5 1.95.  verify32: 1.34 / 1.50 / 1.56 / 1.51 / 1.51 / 1.41 / 1.39.
+decode32: 2.16 / 2.44 / 2.53 / 2.47 / 2.47 / 2.30 / 2.27.  verify1 best G2P4 1.87. err 2e-3.
+Reading: plateau at P=4; G2P4 +3.8% over check 2's best (G3P4 2.12) -> counts as a flat check (1 of 3 toward the kill line, vs the best so far). Higher regs (G2P8 152, G3P8 168) and
+forced lower regs (MB5, 96) both worse.
+Hypothesis for check 4: L2->SM traffic. Each of the 128 warps of a token group copies the SAME 512 B A tile per k-step next to its own 576 B W+S (traffic 1088 vs 576 B/step):
+RINGONLY 2.86 TB/s weights ~ 4.7 TB/s L2->SM, near the practical L2 limit. Fix: share the A ring across the 4 warps of a CTA (items of a CTA share g, ks; ntiles%4==0): each warp loads
+P/4 of the group's A tiles, one __syncthreads per P steps. Variants (v6, mk6_k<G,P,MODE>): control G2P4 (old kernel, same run), A_G2P4, A_G3P4, A_G4P4, A_G2P8, RINGONLY_A_G2P4 (floor).
+Expect A_G2P4 2.5-2.9 at verify16 if traffic-bound (verify32 hot expert too); flat (<2.3) -> L2 traffic is not it, then only dequant instruction count remains.
