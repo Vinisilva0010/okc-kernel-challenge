@@ -141,3 +141,11 @@ Hypothesis for check 4: L2->SM traffic. Each of the 128 warps of a token group c
 RINGONLY 2.86 TB/s weights ~ 4.7 TB/s L2->SM, near the practical L2 limit. Fix: share the A ring across the 4 warps of a CTA (items of a CTA share g, ks; ntiles%4==0): each warp loads
 P/4 of the group's A tiles, one __syncthreads per P steps. Variants (v6, mk6_k<G,P,MODE>): control G2P4 (old kernel, same run), A_G2P4, A_G3P4, A_G4P4, A_G2P8, RINGONLY_A_G2P4 (floor).
 Expect A_G2P4 2.5-2.9 at verify16 if traffic-bound (verify32 hot expert too); flat (<2.3) -> L2 traffic is not it, then only dequant instruction count remains.
+RESULT job 24627bd85684493f (official 5/5, 1.56x verify16 v1 path). regs: G2P4 123, A_G2P4 109, A_G3P4 115, A_G4P4 105, A_G2P8 128, RONLY_A_G2P4 89 (local 0).
+verify16 TB/s: G2P4 2.20 (206us) A_G2P4 2.35 (193us) A_G3P4 2.25 A_G4P4 2.28 A_G2P8 2.28 | RINGONLY_A_G2P4 3.18 (143us).
+verify32: 1.55 / 1.68 / 1.60 / 1.63 / 1.63 | RINGONLY 2.52 (173us).  decode32: 2.53 / 2.67 ... RINGONLY 3.42.  verify1: 1.87 / 1.96.  decode1 1.71 / 1.79.  err 2e-3.
+Reading: shared A ring +6.8% (verify16), +8% (verify32) -> above the 5% line, kill counter reset. Best so far: A_G2P4 (2.35 / 1.68 / 2.67 / 1.96 / 1.79).
+Ring floor now 3.18 TB/s (verify16); dq+mma add ~50 us on top (193 vs 143). verify32: RINGONLY 173 vs 143 at verify16 -> hot expert's 13 re-copies cost ~30 us, plus 13x dequant.
+Next (check 5, v7): groups with >16 tokens go to an NT2 or NT4 kernel with the shared A ring (regs permitting), groups <=16 stay on NT1; two launches into the same out (disjoint rows).
+Variants: A_G2P4 (control, all NT1), SPLIT2 (chunk 32), SPLIT4 (chunk 64). Expect verify32 1.9-2.2 if the hot expert dominated; verify16 slightly up (45-token expert).
+Decision: SPLIT gives >= +8% at verify32 and no loss elsewhere -> adopt; NT regs kill it again (<3%) -> stay NT1 and spend remaining checks on dq issue count.
