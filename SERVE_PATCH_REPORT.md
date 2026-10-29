@@ -124,3 +124,46 @@ Small M is 1-4% lower (extra reduce kernel, plane reads), verify16/32 1.6% highe
 - Exact-answer rule (risk 1 above) stands: v1 is deterministic and 5.7e-3 from stock at the bf16-output level; v2 is expected to remove most of that. Run v2's first check before the first serving check.
 - Run-to-run nondeterminism (risk 2) is closed by v1 (bitwise reproducible in all tested M).
 - Scratch grew from 128 MB to 176 MB per device (still far below the 400 MB limit of the plan).
+
+
+# v2 result (Oct 29, evening): Marlin write-out rounding - ADOPTED, in the patch
+
+Check: measure_mk5_num.py (= sub_mk5 + prepare-time MKNUM study), job 3a3931cbb62f4cfe, 5/5 tests pass, mk active. This was the last muse_moe_w4a16 check of the day (0 of 20 left).
+v2 = v1 plus stock Marlin's write-out: the GEMM stores raw accumulators; the consumers compute `rb(rb(sum of K-slice planes) * gs_bf16[expert of row])` (`exp_of_row` from the route kernel).
+
+## MKNUM table (OURS vs SGLang serving call sequence; v1 for comparison)
+| M | v2 vs stock rel L2 | v2 max abs | v2 elements differing | v1 vs stock rel L2 | v1 elements differing | OURS vs OURS |
+|---|---|---|---|---|---|---|
+| 1 | 5.3e-5 | 9.8e-4 | 0.2% | 5.79e-3 | 70% | bitwise |
+| 8 | 2.9e-4 | 3.9e-3 | 0.5% | 5.79e-3 | 68% | bitwise |
+| 16 | 1.0e-3 | 1.2e-2 | 2.2% | 5.70e-3 | 68% | bitwise |
+| 32 | 1.6e-4 | 3.9e-3 | 0.4% | 5.72e-3 | 66% | bitwise |
+| 128 | 2.5e-4 | 7.8e-3 | 0.9% | 5.65e-3 | 63% | bitwise |
+| 256 | 3.2e-4 | 7.8e-3 | 0.7% | 5.71e-3 | 56% | bitwise |
+Stock vs stock: bitwise equal at M <= 128, rel 5.6e-5 at M = 256 (same run). Stage study (M = 8 / 128): GEMM1 bf16 output vs stock rel 2.4e-5 / 2.8e-5 with 100% of elements equal; silu * up 6.4e-5 / 1.3e-4 (100% equal);
+GEMM2 bf16 output 3.0e-4 / 3.1e-4 (99% equal). So the Marlin write-out rounding was the missing piece: 20-100x closer to stock than v1. What remains: rare one-ulp flips from fp32 summation order (Marlin's block reduce vs ours),
+which GEMM2 and the norm amplify to 1e-4..3e-4 at the output; M = 16 is the weakest (1.0e-3 from a few elements, max 1.2e-2). Not reached: "as well as stock agrees with itself" if that means bitwise (stock is bitwise self-equal for M <= 128);
+reached: within the same order of magnitude as stock's own M = 256 self-disagreement (5.6e-5) at M = 1 and ~3-5x above it elsewhere.
+
+## Speed table (judge, vs SGLang)
+| load | v0 / sub_mk3 (job 3bf003f0) | v1 (job 53b30705) | v2 (job 3a3931cb) | v2 vs v1 |
+|---|---|---|---|---|
+| decode 1 | 1.698x | 1.624x | 1.583x | -2.5% |
+| decode 16 | 1.293x | 1.276x | 1.249x | -2.1% |
+| decode 32 | 1.096x | 1.095x | 1.081x | -1.3% |
+| verify 1 | 1.371x | 1.325x | 1.313x | -0.9% |
+| verify 16 | 1.492x | 1.516x | 1.468x | -3.2% |
+| verify 32 | 1.484x | 1.508x | 1.473x | -2.3% |
+| overall | 1.393x | 1.379x | 1.351x | -2.0% |
+The extra cost is the consumers' second rounding step and the expert lookup per row, plus judge noise (SGLang's own time moved between jobs; per-case differences are of the size of earlier same-code reruns, about 2%). Accepted: parity matters more than 2%.
+
+## Patch state
+`mk_moe/mk_moe.py` is now v2 (v1 frozen as mk_moe_v1.py, v0 as mk_moe_v0.py, mk_moe_v2.py identical to mk_moe.py). Both generators rerun: `sub_mk4.py` / `sub_mk5.py` clean files regenerated (identical bodies; neither was checked as a clean file, the study file measure_mk5_num.py was, and it differs only
+by the prepare-time study), `muse_mk_moe.py` in serve/sglang byte-identical to mk_moe.py (cmp). serve/patch.diff regenerated with `git diff a55ab7d5` in serve/sglang: 4 files, 649 added lines, longest 268 chars, 37,402 bytes, 0 non-ASCII lines;
+tools/check_patch_rules.py: RULES OK; py_compile ok for all four files; `git apply --check -R` clean. Nested repo commit e8af105 on my-patch.
+
+## Risks for Nov 5 (updated)
+1. Exact-answer rule: now ~1e-4..1e-3 from stock at the bf16 output (was 5.7e-3) and deterministic, but not bitwise equal to stock; whether that passes the judge's comparison is still only knowable from a serving check.
+2. Nondeterminism: closed (bitwise run-to-run in all tested M).
+3. Startup build (8 ranks, load_inline), CUDA-graph capture inside SGLang, shared scratch buffers across streams, weight reload: unchanged from the first report; none testable here.
+4. Speed margin: overall 1.351x in phase 1 (decode 32 only 1.08x); the serving gain at concurrency 32 will be small.

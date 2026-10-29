@@ -257,7 +257,7 @@ def build(with_self):
     body = head + skeleton + "\n\n" + torch_path + "\n\n# ============================================================================================ MK MoE (mk_moe/mk_moe.py, verbatim)\n" + MK
     g = glue.replace("    SELFCHECK_HOOK\n", selfcheck if with_self else "")
     body += (selfcheck_fn if with_self else "") + g
-    return adapt_v2(body) if (V2 and with_self) else body
+    return adapt_v2(body) if ("exp_of_row" in MK and with_self) else body
 
 
 if V2:
