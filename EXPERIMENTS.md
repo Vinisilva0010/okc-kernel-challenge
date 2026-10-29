@@ -204,3 +204,11 @@ verify32 2/4 412.5 vs 2/2 417.2 (-1.1%). Ring G3 never wins (best G3 entries are
 Reading: the table is at its optimum (<= 3%, within run noise ~1-2%); GEMM2 does not want a different KS from GEMM1; deeper ring does not help.
 STOP: check 3 was the last one that moved a case by >= 3%; check 4 found nothing to adopt. Budget: 4 of the 8 allowed checks used (6 of 20 left today). Final candidate = sub_mk2.py (job 5ea1d8aa3b604660).
 sub_mk3.py (ring/KS-per-GEMM plumbing, never run as an official check) removed to avoid confusion; measure_mkp_v2.py keeps the study.
+
+## DAY_PLAN2 (serving patch v0), Step 1-2: mk_moe/mk_moe.py -> sub_mk3 (reduced prepare, MKSELF)
+Check 1 of <=4 (measure_mk3_self.py = sub_mk3 + CHECK-only self-check in prepare): Question: does the single-source MkMoE module (kernels copied from sub_mk2, epilogue now with a weight_first flag,
+routing for any local_offset, fp32 global scales bound once per layer) reproduce sub_mk2's 5/5 pass and per-case speedups with a prepare() reduced to Marlin repack + buffers?
+Expect: 5/5; per case within ~3% of sub_mk2 (decode1 1.66, decode16 1.29, decode32 1.08, verify1 1.33, verify16 1.48, verify32 1.48; overall ~1.377). MKSELF: offset0==offset96 bitwise True for M=33,128,256
+(KS 2: two partial sums, exact), maxabs ~0..1 bf16 ulp for M<=32 (KS>=4: atomic order), rel_vs_marlin ~3e-3, epilogue torch twin rel ~1e-3 or better for BOTH norm forms.
+Decisions: pass -> generate the SGLang module (done by the tool) and check the clean sub_mk3.py once (check 2); MKSELF off96 != off0 beyond atomic order -> routing bug, fix before Step 3;
+wf=False epilogue error > 1e-2 -> fix kernel.
