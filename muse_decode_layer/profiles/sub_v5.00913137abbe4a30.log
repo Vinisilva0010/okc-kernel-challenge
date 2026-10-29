@@ -1,0 +1,11 @@
+okc-diag HAVE_SGLANG=True
+okc-diag smallm selfcheck () rel L2 vs Marlin: 6.664e-03
+okc-diag smallm active=True
+okc-diag largem selfcheck rel L2 vs Marlin: m128=5.59e-03 m256=5.61e-03
+okc-diag largem active={128: True, 256: True}
+okc-diag moe5 selfcheck rel L2 vs Marlin: m1=6.80e-03 m2=5.69e-03 m4=5.54e-03 m8=5.64e-03 m12=5.57e-03 m16=5.65e-03 m32=5.51e-03 m33=5.63e-03 m128=5.61e-03 m256=5.63e-03
+okc-diag moe5 active={1: True, 2: True, 4: True, 8: True, 12: True, 16: True, 32: True, 128: True, 256: True}
+okc-diag G2 pre-norm max steps vs module: 0
+okc-diag G3 unpooler rel L2 vs cuBLAS: 8.990e-05 ok=True
+okc-diag G4 epilogue grid bitwise=True
+okc-diag glue switches: G2=True G3=True G4=True
