@@ -11,7 +11,8 @@ D = ROOT + "muse_moe_w4a16/"
 SG_MODULE = ROOT + "serve/sglang/python/sglang/srt/layers/moe/muse_mk_moe.py"
 
 V1 = open(D + "sub_v1.py").read()
-MK = open(D + "mk_moe/mk_moe.py").read()
+V2 = "--v2" in sys.argv  # candidate v2 (Marlin write-out rounding): writes sub_mk5.py / measure_mk5_num.py, never the SGLang module
+MK = open(D + ("mk_moe/mk_moe_v2.py" if V2 else "mk_moe/mk_moe.py")).read()
 MK_V0 = open(D + "mk_moe/mk_moe_v0.py").read()  # frozen v0 module, embedded in the study file only
 
 
@@ -236,15 +237,34 @@ def _mk_numcheck(state, weights):
 '''
 
 
+def adapt_v2(text):
+    def r(old, new):
+        nonlocal text
+        assert text.count(old) == 1, old[:60]
+        text = text.replace(old, new)
+
+    r('b["slot_of_row"], b["row_of_slot"], n, 0, 32)', 'b["slot_of_row"], b["row_of_slot"], b["exp_of_row"], n, 0, 32)')
+    r('e.mkp_gemm(lw.w13, lw.w13_s, lw.gs13, b["xg"]', 'e.mkp_gemm(lw.w13, lw.w13_s, b["xg"]')
+    r('e.mkp_gemm(lw.w2, lw.w2_s, lw.gs2, b["inter"]', 'e.mkp_gemm(lw.w2, lw.w2_s, b["inter"]')
+    r('    c1f = c1\n    c1 = c1.to(torch.bfloat16)\n    e.mkp_act(b["part"], b["inter"], b["ctl"], n, ks, k1)',
+      '    ge = b["exp_of_row"][:n].long()\n    c1f = c1\n    c1 = (c1.to(torch.bfloat16).float() * lw.gs13[ge].unsqueeze(1)).to(torch.bfloat16)\n    e.mkp_act(b["part"], b["inter"], b["ctl"], n, ks, k1, b["exp_of_row"], lw.gs13)')
+    r('    return b["row_of_slot"][:n].clone(), c1, c2, y.to(torch.bfloat16), c1f',
+      '    y = (y.to(torch.bfloat16).float() * lw.gs2[ge].unsqueeze(1)).to(torch.bfloat16)\n    return b["row_of_slot"][:n].clone(), c1, c2, y, c1f')
+    return text
+
+
 def build(with_self):
     body = head + skeleton + "\n\n" + torch_path + "\n\n# ============================================================================================ MK MoE (mk_moe/mk_moe.py, verbatim)\n" + MK
     g = glue.replace("    SELFCHECK_HOOK\n", selfcheck if with_self else "")
     body += (selfcheck_fn if with_self else "") + g
-    return body
+    return adapt_v2(body) if (V2 and with_self) else body
 
 
-open(D + "sub_mk4.py", "w").write(build(False))
-open(SG_MODULE, "w").write(MK)
+if V2:
+    open(D + "sub_mk5.py", "w").write(build(False))
+else:
+    open(D + "sub_mk4.py", "w").write(build(False))
+    open(SG_MODULE, "w").write(MK)
 if "--study" in sys.argv:
-    open(D + "measure_mk4_num.py", "w").write(build(True))
+    open(D + ("measure_mk5_num.py" if V2 else "measure_mk4_num.py"), "w").write(build(True))
 print("ok")

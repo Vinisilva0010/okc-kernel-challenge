@@ -254,3 +254,10 @@ Reading: rounding points were not the cause; the stages differ already at GEMM1 
 (act grid (rows,4) with all plane loads in flight; a small reduce kernel writing dense bf16 y; epilogue reads bf16 y) to restore small-M speed, and the truth study repeated with Marlin's bf16-rounded global scale
 (separates the common scale rounding from real arithmetic differences) incl. our fp32 GEMM1 sum before rounding.
 Expect: speed back within ~3% of sub_mk3 (decode1 ~1.7, decode16 ~1.29, decode32 ~1.09, verify1 ~1.37, verify16/32 ~1.49); ours_fp32 vs truth(bf16 gs) ~1e-6..1e-4 if our GEMM is exact; stock vs truth(bf16 gs) tells stock's extra error.
+RESULT check 3, job 53b3070582c447a5 (measure_mk4_num.py with parallel plane reduction; official 5/5): overall 1.379x. decode1 1.624 (47.1 us), decode16 1.276, decode32 1.095, verify1 1.325, verify16 1.516 (301.6), verify32 1.508 (408.3).
+Speed restored (sub_mk3: 1.698 / 1.293 / 1.096 / 1.371 / 1.492 / 1.484; small-M within noise, verify16/32 +1.6% / +1.6%). Determinism: new_vs_new bitwise at all M; serving stock bitwise self-equal for M<=128 (M=256 rel 6.2e-5). scratch 176 MB.
+new_vs_servingstock rel 5.65e-3..5.79e-3 (63-70% elements differ) - unchanged. STAGE (M=8,128): GEMM1 vs stock 2.8e-3; truth with Marlin's bf16 global scale: stock 2.3e-3, ours(bf16) 1.7e-3, ours FP32 sum 1.7e-7 / 4.9e-7.
+=> our GEMM is exact to fp32 roundoff; stock has an extra ~1.6e-3 error. Found its source by reading marlin_template.h (write lambda, lines ~1355-1368): res = float2num(c0,c1) [bf16 round of the fp32 accumulator] THEN
+res = __hmul2(res, global_scale) [bf16 multiply, second rounding]. Stock output = bf16(bf16(acc_raw) * gs_bf16). We applied gs in fp32 inside the GEMM and rounded once.
+Fix (candidate v2, NOT yet checked - plan budget of 3 checks is spent): GEMM stores raw acc (no gs); consumers do rb(rb(sum) * gs[expert of row]) (act for GEMM1, reduce for GEMM2); needs exp_of_row from the route kernel.
+Expect: GEMM1 bf16 output equal to stock for ~all elements (differences only from fp32 summation order, rare 1-ulp flips), final output rel vs stock ~1e-4 or less, speed unchanged. First thing to run next time.
