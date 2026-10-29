@@ -222,3 +222,14 @@ Check 2 of <=4 (sub_mk3.py, clean, no study/selfcheck code): Question: does the 
 differs by > 3% -> look for a difference between measure_mk3_self and sub_mk3 (only the prepare() self-check block).
 RESULT check 2, job 3bf003f0784c4e97 (sub_mk3.py clean): 5/5 pass, overall 1.393x (CI 1.372-1.414), mk active. decode1 1.698 (45.6 us), decode16 1.293, decode32 1.096, verify1 1.371 (103.9), verify16 1.492 (307.6), verify32 1.484 (420.0 vs 623.4).
 Identical to job 2ceb32ff within noise (<= 2%). Decision: stop checking (2 of the 4 allowed used; 4 of 20 daily checks left); nothing changes before the Nov 5 serving window except what a serving check reveals.
+
+## DAY_PLAN3 (numerics parity + determinism for the MK MoE = serving patch v1)
+Changes in mk_moe/mk_moe.py (v0 frozen as mk_moe_v0.py): (1) GEMM1 and GEMM2 outputs are the bf16 rounding of the fp32 sum of the K-slice partials (stock Marlin fp32-reduce then bf16 store);
+silu_and_mul as stock builds it for sm90 (bf16 gate/up in, fp32 __fdividef(g, 1 + __expf(-g)) * u, one bf16 rounding); epilogue per slot in fp32 in ascending slot order like stock's fused kernel
+(weight_first: ((x*w)*rsqrt(mean((x*w)^2)+eps))*s, else ((x*rsqrt(mean(x^2)+eps))*w)*s). (2) Split-K without atomics and without zeroing: slice s stores its fp32 partial in its own plane [KS, 8M, N]
+(one shared buffer, GEMM2 reuses GEMM1's after the activation), consumers add planes in order 0..KS-1.
+Check 1 of <=3 (measure_mk4_num.py = sub_mk4 + CHECK-only MKNUM study): Question: how close is the new path to stock Marlin, and is it deterministic? Real-like routing at M in (1, 8, 16, 32, 128, 256).
+Expect: new_vs_new bitwise equal at every M; new_vs_stock rel L2 well below old (~5e-3), likely 1e-3..3e-3 (bf16 ulp scale since both round to bf16); old_vs_old not bitwise for M <= 32; stock_vs_stock = reference for 'agrees with itself'.
+Speed within ~3% of sub_mk3 (overall 1.393x): the GEMM epilogue now stores instead of atomics and the zeroing is gone, so it may be slightly faster; consumers re-read KS planes (M=1: 16).
+Decisions: new_vs_new bitwise and new_vs_stock <= old and within about 2x stock_vs_stock -> check 2 (clean sub_mk4); not deterministic -> look for a race (e.g. partial planes overlapping, KS plane stride);
+new_vs_stock not better than old -> the rounding points differ from stock: inspect which stage (compare intermediates) before spending check 2.

@@ -11,7 +11,7 @@ D = ROOT + "muse_moe_w4a16/"
 SG_MODULE = ROOT + "serve/sglang/python/sglang/srt/layers/moe/muse_mk_moe.py"
 
 V1 = open(D + "sub_v1.py").read()
-MK = open(D + "mk_moe/mk_moe.py").read()
+MK = open(D + "mk_moe/mk_moe_v0.py").read()  # frozen v0 module: sub_mk3 stays reproducible
 
 
 def between(text, start, end):
@@ -119,7 +119,7 @@ def build(with_self):
 
 
 open(D + "sub_mk3.py", "w").write(build(False))
-open(SG_MODULE, "w").write(MK)
+# (the SGLang module is written by build_sub_mk4.py)
 if "--selfcheck" in sys.argv:
     open(D + "measure_mk3_self.py", "w").write(build(True))
 print("ok")
