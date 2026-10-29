@@ -74,3 +74,10 @@ In the phase-1 file, `state["banks"][(0, 32)]` (built by `_prepare_sglang` with 
 | RING8_BIAS | 80 | 1.36 | 1.90 | 2.21 | 1.84 | 1.65 |
 Reading: ring depth 4 = 8 -> no longer latency-bound; the instruction chain (dequant + scales + mma per 512 B) is the limit.
 verify32 lags because the 201-token expert is dequantized 13 times (one 16-token group per warp item).
+
+## Serving judge facts (from https://openkernelchallenge.dev/llms.txt, read Oct 29)
+- "Your outputs have to agree with stock SGLang's nearly as well as it agrees with itself, and every request has to return exactly 220 tokens."
+  So numerics must stay CLOSE to stock (tolerance = stock's own run-to-run agreement), not just "correct within the kernel tolerance".
+- TTFT at most 2x stock at each load; compile time counts toward the 90-min run limit but not the score.
+- Prizes on the serving board only: 1st $50k + signed H200, 2nd $30k, 3rd $10k, 4th $3k, 5th $2k, 6th-10th $1k.
+- Kernel final review reruns top entries on the scored shapes AND nearby ones.
