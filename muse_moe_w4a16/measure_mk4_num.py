@@ -360,7 +360,8 @@ MK_EXPERTS = 32
 _MK_CPP = r"""#include <torch/extension.h>
 void mkp_init();
 void mkp_route(torch::Tensor ids, torch::Tensor local_ids, torch::Tensor ctl, torch::Tensor gtab, torch::Tensor slot_of_row, torch::Tensor row_of_slot, int64_t n_slots, int64_t lo, int64_t hi);
-void mkp_epi(torch::Tensor part, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf, int64_t ks, int64_t ksw);
+void mkp_reduce(torch::Tensor part, torch::Tensor y, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw);
+void mkp_epi(torch::Tensor y, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf);
 void mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor slot_of_row, torch::Tensor ctl, int64_t max_rows);
 void mkp_act(torch::Tensor part, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw);
 void mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor gsc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out, int64_t max_groups, int64_t K, int64_t N, int64_t KS, int64_t ksw);
@@ -604,16 +605,30 @@ __global__ void __launch_bounds__(256) mkp_gather_k(const uint4* __restrict__ x,
 __device__ __forceinline__ float mkp_rb(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
 // Sum of the KS partials of 4 consecutive floats, in slice order, rounded to bf16 (what stock Marlin's fp32-reduce GEMM stores).
+// The plane loads are issued 8 at a time (independent) and added in order, so the sum is the same as a serial loop.
 __device__ __forceinline__ float4 mkp_sum4(const float4* __restrict__ part, size_t idx, size_t ks_stride4, int ks) {
     float4 a = part[idx];
-    for (int s = 1; s < ks; ++s) {
-        const float4 b = part[idx + (size_t)s * ks_stride4];
-        a.x += b.x;
-        a.y += b.y;
-        a.z += b.z;
-        a.w += b.w;
+    for (int s0 = 1; s0 < ks; s0 += 8) {
+        float4 v[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t) v[t] = (s0 + t < ks) ? part[idx + (size_t)(s0 + t) * ks_stride4] : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (s0 + t < ks) {
+                a.x += v[t].x;
+                a.y += v[t].y;
+                a.z += v[t].z;
+                a.w += v[t].w;
+            }
+        }
     }
     return make_float4(mkp_rb(a.x), mkp_rb(a.y), mkp_rb(a.z), mkp_rb(a.w));
+}
+
+__device__ __forceinline__ float4 mkp_ld4(const uint2* __restrict__ yb, size_t idx) {
+    const uint2 raw = yb[idx];
+    const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x), b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+    return make_float4(__low2float(a), __high2float(a), __low2float(b), __high2float(b));
 }
 
 // silu_and_mul as stock builds it for sm90 (fast math): bf16 gate and up in, fp32 silu(gate) * up, one bf16 rounding.
@@ -625,24 +640,34 @@ __global__ void __launch_bounds__(256) mkp_act_k(const float4* __restrict__ part
     const int r = blockIdx.x;
     if (r >= ctl[0]) return;
     const size_t ks4 = ksw / 4;
-    for (int i = threadIdx.x; i < 1024; i += 256) {
-        const float4 g = mkp_sum4(part, (size_t)r * 2048 + i, ks4, ks);
-        const float4 u = mkp_sum4(part, (size_t)r * 2048 + 1024 + i, ks4, ks);
-        inter[(size_t)r * 2048 + 2 * i] = __floats2bfloat162_rn(mkp_silu_mul(g.x, u.x), mkp_silu_mul(g.y, u.y));
-        inter[(size_t)r * 2048 + 2 * i + 1] = __floats2bfloat162_rn(mkp_silu_mul(g.z, u.z), mkp_silu_mul(g.w, u.w));
-    }
+    const int i = blockIdx.y * 256 + threadIdx.x;  // grid (rows, 4): 1024 float4 per row
+    const float4 g = mkp_sum4(part, (size_t)r * 2048 + i, ks4, ks);
+    const float4 u = mkp_sum4(part, (size_t)r * 2048 + 1024 + i, ks4, ks);
+    inter[(size_t)r * 2048 + 2 * i] = __floats2bfloat162_rn(mkp_silu_mul(g.x, u.x), mkp_silu_mul(g.y, u.y));
+    inter[(size_t)r * 2048 + 2 * i + 1] = __floats2bfloat162_rn(mkp_silu_mul(g.z, u.z), mkp_silu_mul(g.w, u.w));
+}
+
+// y[r] = bf16(sum of the GEMM2 partials), dense [rows, 4096]; grid (rows, 4).
+__global__ void __launch_bounds__(256) mkp_red_k(const float4* __restrict__ part, uint2* __restrict__ y, const int* __restrict__ ctl, int ks, size_t ksw) {
+    const int r = blockIdx.x;
+    if (r >= ctl[0]) return;
+    const int i = blockIdx.y * 256 + threadIdx.x;
+    const float4 v = mkp_sum4(part, (size_t)r * 1024 + i, ksw / 4, ks);
+    __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+    uint2 packed;
+    packed.x = *reinterpret_cast<uint32_t*>(&lo);
+    packed.y = *reinterpret_cast<uint32_t*>(&hi);
+    y[(size_t)r * 1024 + i] = packed;
 }
 
 
 // Fused scatter + post-expert norm + weighted sum, per slot in fp32 like stock's fused kernel:
 //   weight_first: y = (x * w) * rsqrt(mean((x * w)^2) + eps);  otherwise y = (x * rsqrt(mean(x^2) + eps)) * w;  out = bf16(sum over live k ascending of y * s_k).
-// x = bf16(sum of the GEMM2 partials) of the route's row.
-__global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ part, const int* __restrict__ row_of_slot, const float* __restrict__ topk_w,
-                                                 const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ out, float eps, int wf, int ks,
-                                                 size_t ksw) {
+// x = the bf16 GEMM2 output row of the route (written by mkp_red_k).
+__global__ void __launch_bounds__(256) mkp_epi_k(const uint2* __restrict__ yb, const int* __restrict__ row_of_slot, const float* __restrict__ topk_w,
+                                                 const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ out, float eps, int wf) {
     __shared__ float red[8][8];
     const int tok = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-    const size_t ks4 = ksw / 4;
     int rows[8];
     float ss[8];
     float4 w[4];
@@ -659,7 +684,7 @@ __global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ part
         if (rows[k] >= 0) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const float4 y = mkp_sum4(part, (size_t)rows[k] * 1024 + tid + 256 * j, ks4, ks);
+                const float4 y = mkp_ld4(yb, (size_t)rows[k] * 1024 + tid + 256 * j);
                 const float a = wf ? y.x * w[j].x : y.x, b = wf ? y.y * w[j].y : y.y, c = wf ? y.z * w[j].z : y.z, d = wf ? y.w * w[j].w : y.w;
                 s += a * a + b * b + c * c + d * d;
             }
@@ -687,7 +712,7 @@ __global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ part
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
             if (rows[k] >= 0) {
-                const float4 y = mkp_sum4(part, (size_t)rows[k] * 1024 + tid + 256 * j, ks4, ks);
+                const float4 y = mkp_ld4(yb, (size_t)rows[k] * 1024 + tid + 256 * j);
                 const float sk = topk_w[tok * 8 + k];
                 if (wf) {
                     acc.x += (y.x * w[j].x * rinv[k]) * sk;
@@ -733,16 +758,21 @@ void mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor slot_of_row, to
 
 void mkp_act(torch::Tensor part, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw) {
     auto st = at::cuda::getCurrentCUDAStream();
-    mkp_act_k<<<(int)max_rows, 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()),
+    mkp_act_k<<<dim3((unsigned)max_rows, 4), 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()),
                                              reinterpret_cast<__nv_bfloat162*>(inter.data_ptr<at::BFloat16>()), ctl.data_ptr<int>(), (int)ks, (size_t)ksw);
 }
 
-void mkp_epi(torch::Tensor part, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf,
-             int64_t ks, int64_t ksw) {
+void mkp_reduce(torch::Tensor part, torch::Tensor y, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw) {
     auto st = at::cuda::getCurrentCUDAStream();
-    mkp_epi_k<<<(int)m, 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()), row_of_slot.data_ptr<int>(), topk_w.data_ptr<float>(),
+    mkp_red_k<<<dim3((unsigned)max_rows, 4), 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()), reinterpret_cast<uint2*>(y.data_ptr<at::BFloat16>()),
+                                                           ctl.data_ptr<int>(), (int)ks, (size_t)ksw);
+}
+
+void mkp_epi(torch::Tensor y, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    mkp_epi_k<<<(int)m, 256, 0, st>>>(reinterpret_cast<const uint2*>(y.data_ptr<at::BFloat16>()), row_of_slot.data_ptr<int>(), topk_w.data_ptr<float>(),
                                       reinterpret_cast<const __nv_bfloat16*>(norm_w.data_ptr<at::BFloat16>()), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-                                      (float)eps, (int)wf, (int)ks, (size_t)ksw);
+                                      (float)eps, (int)wf);
 }
 
 // max_groups: worst-case group count for the call's M (shape only); warps beyond the device-side n_groups exit at once.
@@ -772,7 +802,7 @@ def _mk_ext():
             name=f"muse_mk_moe_{key}",
             cpp_sources=_MK_CPP,
             cuda_sources=_MK_CUDA,
-            functions=["mkp_init", "mkp_route", "mkp_gather", "mkp_act", "mkp_epi", "mkp_gemm"],
+            functions=["mkp_init", "mkp_route", "mkp_gather", "mkp_act", "mkp_reduce", "mkp_epi", "mkp_gemm"],
             extra_cuda_cflags=["-O3"],
             verbose=False,
         )
@@ -831,6 +861,7 @@ class MkMoE:
             "row_of_slot": torch.zeros(rmax, dtype=torch.int32, device=device),
             "xg": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),
             "inter": torch.zeros(rmax, inter, dtype=torch.bfloat16, device=device),
+            "y": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),
             # fp32 split-K partials [KS, 8 * M, N] of the call in flight; GEMM2 reuses GEMM1's after the activation has consumed them
             "part": torch.zeros(max(_mk_ks(m) * top_k * m for m in range(1, max_tokens + 1)) * 2 * inter, dtype=torch.float32, device=device),
         }
@@ -863,8 +894,9 @@ class MkMoE:
         e.mkp_gemm(layer.w13, layer.w13_s, layer.gs13, b["xg"], b["gtab"], b["ctl"], b["part"], ng, MK_HIDDEN, 2 * MK_INTER, ks, ksw1)
         e.mkp_act(b["part"], b["inter"], b["ctl"], n_slots, ks, ksw1)
         e.mkp_gemm(layer.w2, layer.w2_s, layer.gs2, b["inter"], b["gtab"], b["ctl"], b["part"], ng, MK_INTER, MK_HIDDEN, ks, ksw2)
+        e.mkp_reduce(b["part"], b["y"], b["ctl"], n_slots, ks, ksw2)
         out = torch.empty((m, MK_HIDDEN), dtype=torch.bfloat16, device=x.device)
-        e.mkp_epi(b["part"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0, ks, ksw2)
+        e.mkp_epi(b["y"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0)
         return out
 
 
@@ -880,8 +912,6 @@ def mk_shared(device):
 
 
 # ---- CHECK-only numerics study (never part of a submitted file). The v0 module (before numerics parity) is embedded as text.
-_MK_V0_SRC = '"""Marlin-layout NVFP4 MoE for Muse Spark (hidden 4096, intermediate 4096, top-8, 32 local experts, M <= 256).\n\nSingle source of truth: tools/build_sub_mk3.py pastes this file into the phase-1 check file and copies it unchanged to\npython/sglang/srt/layers/moe/muse_mk_moe.py. Weights are SGLang\'s Marlin tensors as they are (no second copy).\nPath: route (GPU) -> gather + zero fp32 accumulators -> GEMM1 -> SiLU(gate) * up -> GEMM2 -> fused post-expert norm + weighted sum.\nGraph safe: buffers are allocated once in alloc(), group counts live in device memory, grids depend on M only.\nThe Marlin dequant bit tricks follow sglang kernels/jit/csrc/gemm/marlin/dequant.h (Apache-2.0).\n"""\n\nimport hashlib\n\nimport torch\n\nMK_TOP_K = 8\nMK_HIDDEN = 4096\nMK_INTER = 4096\nMK_MAX_TOKENS = 256\nMK_EXPERTS = 32\n\n_MK_CPP = r"""#include <torch/extension.h>\nvoid mkp_init();\nvoid mkp_route(torch::Tensor ids, torch::Tensor local_ids, torch::Tensor ctl, torch::Tensor gtab, torch::Tensor slot_of_row, torch::Tensor row_of_slot, int64_t n_slots, int64_t lo, int64_t hi);\nvoid mkp_epi(torch::Tensor out2, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf);\nvoid mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor out1, torch::Tensor out2, torch::Tensor slot_of_row, torch::Tensor ctl, int64_t max_rows);\nvoid mkp_act(torch::Tensor out1, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows);\nvoid mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor gsc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out, int64_t max_groups, int64_t K, int64_t N, int64_t KS);\n"""\n\n_MK_CUDA = r"""#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <cuda_bf16.h>\n#include <cuda_runtime.h>\n#include <stdint.h>\n#include <vector>\n\n__device__ __forceinline__ void mk_dq(uint32_t q, __nv_bfloat162 (&fb)[2]) {\n    const uint32_t MASK = 0x70007000u;\n    uint32_t o1 = (q & 0x80008000u) | ((q & MASK) >> 6);\n    q <<= 4;\n    uint32_t o2 = (q & 0x80008000u) | ((q & MASK) >> 6);\n    fb[1] = *reinterpret_cast<const __nv_bfloat162*>(&o1);\n    fb[0] = *reinterpret_cast<const __nv_bfloat162*>(&o2);\n}\n\n__device__ __forceinline__ void mk_dqs(uint32_t q, __nv_bfloat162 (&fb)[2]) {\n    const uint32_t MASK = 0x7F007F00u;\n    uint32_t o1 = ((q & 0x80008000u) >> 1) | ((q & MASK) >> 4);\n    q <<= 8;\n    uint32_t o2 = ((q & 0x80008000u) >> 1) | ((q & MASK) >> 4);\n    fb[1] = *reinterpret_cast<const __nv_bfloat162*>(&o1);\n    fb[0] = *reinterpret_cast<const __nv_bfloat162*>(&o2);\n}\n\n__device__ __forceinline__ uint32_t mk_bits(__nv_bfloat162 v) { return *reinterpret_cast<uint32_t*>(&v); }\n\n__device__ __forceinline__ void mk_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {\n    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\\n"\n                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])\n                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));\n}\n\n__device__ __forceinline__ uint32_t mk_smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }\n__device__ __forceinline__ void mk_cp16(uint32_t dst, const void* src) {\n    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\\n" :: "r"(dst), "l"(src) : "memory");\n}\n__device__ __forceinline__ void mk_cp16pf(uint32_t dst, const void* src) {\n    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\\n" :: "r"(dst), "l"(src) : "memory");\n}\n__device__ __forceinline__ void mk_cp16z(uint32_t dst, const void* src, int n) {\n    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\\n" :: "r"(dst), "l"(src), "r"(n) : "memory");\n}\n__device__ __forceinline__ void mk_cp8(uint32_t dst, const void* src) {\n    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\\n" :: "r"(dst), "l"(src) : "memory");\n}\n__device__ __forceinline__ void mk_commit() { asm volatile("cp.async.commit_group;\\n" ::: "memory"); }\ntemplate <int NW>\n__device__ __forceinline__ void mk_wait() { asm volatile("cp.async.wait_group %0;\\n" :: "n"(NW) : "memory"); }\n__device__ __forceinline__ uint4 mk_lds128(uint32_t a) {\n    uint4 r;\n    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "r"(a) : "memory");\n    return r;\n}\n__device__ __forceinline__ uint2 mk_lds64(uint32_t a) {\n    uint2 r;\n    asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];\\n" : "=r"(r.x), "=r"(r.y) : "r"(a) : "memory");\n    return r;\n}\n__device__ __forceinline__ void mk_ldsm4(uint32_t (&r)[4], uint32_t a) {\n    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n"\n                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");\n}\n__device__ __forceinline__ void mk_fold(float& f, uint32_t v) { f = __uint_as_float(__float_as_uint(f) ^ v); }\n\n// mk6: NT 1, the A ring is shared by the 4 warps of a CTA (they share g, ks, e, t0, nk: ntiles % 4 == 0). Each warp copies P/4 of every\n// group\'s A tiles; one __syncthreads per group of P k-steps.\ntemplate <int G, int P>\n__global__ void __launch_bounds__(128, 1) mkg_k(const uint4* __restrict__ W, const uint2* __restrict__ Sc, const float* __restrict__ gsc,\n                                                const __nv_bfloat16* __restrict__ X, const int* __restrict__ gtab, float* __restrict__ out,\n                                                const int* __restrict__ ctl, int K, int N, int KS) {\n    extern __shared__ __align__(16) uint8_t mk3_smem[];\n    constexpr int S = G * P;\n    constexpr int PA = P / 4;\n    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n    const int item = blockIdx.x * 4 + warp;\n    const int ntiles = N >> 6;\n    if (item >= ctl[1] * KS * ntiles) return;  // CTA-uniform: items per CTA never straddle (ntiles % 4 == 0)\n    const int nt = item % ntiles;\n    const int rr = item / ntiles;\n    const int ks = rr % KS;\n    const int g = rr / KS;\n    const int e = gtab[3 * g], t0 = gtab[3 * g + 1], nk = gtab[3 * g + 2];\n    const int ktt = K >> 4, kper = ktt / KS, kt0 = ks * kper;\n    const int gq = lane >> 2, cq = lane & 3;\n    const size_t wst = (size_t)(N >> 1), sst = (size_t)(N >> 3);\n    const uint32_t sbase = mk_smem_u32(mk3_smem);\n    const uint32_t sW = sbase + (uint32_t)warp * (uint32_t)(S * 576);\n    const uint32_t sA = sbase + (uint32_t)(4 * S * 576);\n    const uint4* wp = W + ((size_t)e * ktt + kt0) * wst + nt * 32 + lane;\n    const uint2* sp = Sc + ((size_t)e * ktt + kt0) * sst + nt * 8 + (lane & 7);\n    const int arow = lane >> 1, akh = lane & 1;\n    const bool av = arow < nk;\n    const __nv_bfloat16* ap = X + (size_t)(t0 + (av ? arow : 0)) * K + (size_t)kt0 * 16 + akh * 8;\n    const uint32_t a_dst = (uint32_t)(arow * 32 + ((akh ^ ((arow >> 2) & 1)) * 16));\n    const int lr = lane & 15, lk = lane >> 4;\n    const uint32_t a_ld = (uint32_t)(lr * 32 + ((lk ^ ((lr >> 2) & 1)) * 16));\n\n#define MKG_ISSUE(GX)                                                                                  \\\n    {                                                                                                  \\\n        _Pragma("unroll") for (int p = 0; p < P; ++p) {                                                \\\n            const int kx = (GX) * P + p;                                                               \\\n            const uint32_t base_ = sW + (uint32_t)(kx % S) * 576;                                      \\\n            mk_cp16(base_ + lane * 16, wp + (size_t)kx * wst);                                         \\\n            if (lane < 8) mk_cp8(base_ + 512 + lane * 8, sp + (size_t)kx * sst);                       \\\n        }                                                                                              \\\n        _Pragma("unroll") for (int pa = 0; pa < PA; ++pa) {                                            \\\n            const int kx = (GX) * P + warp * PA + pa;                                                  \\\n            mk_cp16z(sA + (uint32_t)(kx % S) * 512 + a_dst, ap + (size_t)kx * 16, av ? 16 : 0);        \\\n        }                                                                                              \\\n    }\n\n    const int ngrp = kper / P;\n#pragma unroll\n    for (int gi = 0; gi < G - 1; ++gi) {\n        if (gi < ngrp) MKG_ISSUE(gi)\n        mk_commit();\n    }\n    float acc[8][4];\n#pragma unroll\n    for (int j = 0; j < 8; ++j)\n#pragma unroll\n        for (int q = 0; q < 4; ++q) acc[j][q] = 0.f;\n    for (int it = 0; it < ngrp; ++it) {\n        mk_wait<G - 2>();\n        __syncthreads();\n        {\n            const int gx = it + G - 1;\n            if (gx < ngrp) MKG_ISSUE(gx)\n            mk_commit();\n        }\n        uint4 wv[P];\n        uint2 scv[P];\n        uint32_t a[P][4];\n#pragma unroll\n        for (int p = 0; p < P; ++p) {\n            const uint32_t slot = (uint32_t)((it * P + p) % S);\n            wv[p] = mk_lds128(sW + slot * 576 + lane * 16);\n            scv[p] = mk_lds64(sW + slot * 576 + 512 + gq * 8);\n            mk_ldsm4(a[p], sA + slot * 512 + a_ld);\n        }\n#pragma unroll\n        for (int p = 0; p < P; ++p) {\n            const uint4 w = wv[p];\n            const uint2 sc = scv[p];\n            const uint32_t wq[4] = {w.x, w.y, w.z, w.w};\n            {\n                __nv_bfloat162 s01[2], s23[2];\n                mk_dqs(sc.x, s01);\n                mk_dqs(sc.y, s23);\n                const __nv_bfloat162 spair[4] = {s01[0], s01[1], s23[0], s23[1]};\n#pragma unroll\n                for (int wi = 0; wi < 4; ++wi) {\n                    const __nv_bfloat162 slo = __bfloat162bfloat162(__low2bfloat16(spair[wi]));\n                    const __nv_bfloat162 shi = __bfloat162bfloat162(__high2bfloat16(spair[wi]));\n                    __nv_bfloat162 f[2];\n                    mk_dq(wq[wi] << 8, f);\n                    const uint32_t blo0 = mk_bits(__hmul2(f[0], slo));\n                    const uint32_t blo1 = mk_bits(__hmul2(f[1], slo));\n                    mk_dq(wq[wi], f);\n                    const uint32_t bhi0 = mk_bits(__hmul2(f[0], shi));\n                    const uint32_t bhi1 = mk_bits(__hmul2(f[1], shi));\n                    mk_mma(acc[2 * wi], a[p], blo0, blo1);\n                    mk_mma(acc[2 * wi + 1], a[p], bhi0, bhi1);\n                }\n            }\n        }\n    }\n    const float gs = gsc[e];\n#pragma unroll\n    for (int j = 0; j < 8; ++j) {\n        const int col = nt * 64 + j * 8 + 2 * cq;\n        const int r0 = gq, r1 = gq + 8;\n        if (r0 < nk) {\n            float* o = out + (size_t)(t0 + r0) * N + col;\n            atomicAdd(o, acc[j][0] * gs);\n            atomicAdd(o + 1, acc[j][1] * gs);\n        }\n        if (r1 < nk) {\n            float* o = out + (size_t)(t0 + r1) * N + col;\n            atomicAdd(o, acc[j][2] * gs);\n            atomicAdd(o + 1, acc[j][3] * gs);\n        }\n    }\n}\n\n\n// ---- MK path kernels. Row space: rows = local routes sorted by expert; slot = token * 8 + k.\n// ctl[0] = n_rows, ctl[1] = n_groups (device ints, written by mkp_route_k). gtab rows: (expert, first row, rows <= 16).\n__global__ void __launch_bounds__(1024) mkp_route_k(const int* __restrict__ ids, int* __restrict__ local_ids, int* __restrict__ ctl,\n                                                    int* __restrict__ gtab, int* __restrict__ slot_of_row, int* __restrict__ row_of_slot, int n_slots, int lo, int hi) {\n    __shared__ int cnt[32];\n    __shared__ int off[33];\n    __shared__ int gbase[33];\n    __shared__ int rank_s[2048];\n    const int tid = threadIdx.x;\n    if (tid < 32) cnt[tid] = 0;\n    __syncthreads();\n    for (int s = tid; s < n_slots; s += blockDim.x) {\n        const int e = ids[s];\n        const int l = (e >= lo && e < hi) ? e - lo : -1;\n        local_ids[s] = l;\n        rank_s[s] = l >= 0 ? atomicAdd(&cnt[l], 1) : 0;\n    }\n    __syncthreads();\n    if (tid == 0) {\n        int o = 0, gb = 0;\n        for (int e = 0; e < 32; ++e) {\n            off[e] = o;\n            gbase[e] = gb;\n            o += cnt[e];\n            gb += (cnt[e] + 15) >> 4;\n        }\n        ctl[0] = o;\n        ctl[1] = gb;\n    }\n    __syncthreads();\n    if (tid < 32) {\n        const int c = cnt[tid];\n        for (int gi = 0; gi * 16 < c; ++gi) {\n            int* t = gtab + 3 * (gbase[tid] + gi);\n            t[0] = tid;\n            t[1] = off[tid] + gi * 16;\n            t[2] = min(16, c - gi * 16);\n        }\n    }\n    for (int s = tid; s < n_slots; s += blockDim.x) {\n        const int l = local_ids[s];\n        if (l >= 0) slot_of_row[off[l] + rank_s[s]] = s;\n        row_of_slot[s] = l >= 0 ? off[l] + rank_s[s] : -1;\n    }\n}\n\n// Block r = row r: Xg[r] = x[slot / 8]; zero out1[r] (fp32 8192) and out2[r] (fp32 4096).\n__global__ void __launch_bounds__(256) mkp_gather_k(const uint4* __restrict__ x, uint4* __restrict__ xg, float4* __restrict__ out1,\n                                                    float4* __restrict__ out2, const int* __restrict__ slot_of_row, const int* __restrict__ ctl) {\n    const int r = blockIdx.x;\n    if (r >= ctl[0]) return;\n    const int tok = slot_of_row[r] >> 3;\n    for (int i = threadIdx.x; i < 512; i += 256) xg[(size_t)r * 512 + i] = x[(size_t)tok * 512 + i];\n    const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);\n    for (int i = threadIdx.x; i < 2048; i += 256) out1[(size_t)r * 2048 + i] = z;\n    for (int i = threadIdx.x; i < 1024; i += 256) out2[(size_t)r * 1024 + i] = z;\n}\n\n// inter[r] = bf16(silu(gate) * up), gate = out1[r][0:4096], up = out1[r][4096:8192].\n__global__ void __launch_bounds__(256) mkp_act_k(const float4* __restrict__ out1, __nv_bfloat162* __restrict__ inter, const int* __restrict__ ctl) {\n    const int r = blockIdx.x;\n    if (r >= ctl[0]) return;\n    for (int i = threadIdx.x; i < 1024; i += 256) {\n        const float4 g = out1[(size_t)r * 2048 + i];\n        const float4 u = out1[(size_t)r * 2048 + 1024 + i];\n        const float a0 = g.x / (1.f + __expf(-g.x)) * u.x, a1 = g.y / (1.f + __expf(-g.y)) * u.y;\n        const float a2 = g.z / (1.f + __expf(-g.z)) * u.z, a3 = g.w / (1.f + __expf(-g.w)) * u.w;\n        inter[(size_t)r * 2048 + 2 * i] = __floats2bfloat162_rn(a0, a1);\n        inter[(size_t)r * 2048 + 2 * i + 1] = __floats2bfloat162_rn(a2, a3);\n    }\n}\n\n\n// Fused scatter + post-expert norm + weighted sum: out[t] = bf16( sum_k live_k * s_k * rmsnorm(y_k * w) ), y_k = fp32 GEMM2 row of route (t, k).\n__global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ out2, const int* __restrict__ row_of_slot, const float* __restrict__ topk_w,\n                                                 const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ out, float eps, int wf) {\n    __shared__ float red[8][8];\n    const int tok = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;\n    int rows[8];\n    float ss[8];\n    float4 w[4];\n#pragma unroll\n    for (int j = 0; j < 4; ++j) {\n        const uint2 raw = *reinterpret_cast<const uint2*>(norm_w + (tid + 256 * j) * 4);\n        const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x), b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);\n        w[j] = make_float4(__low2float(a), __high2float(a), __low2float(b), __high2float(b));\n    }\n#pragma unroll\n    for (int k = 0; k < 8; ++k) {\n        rows[k] = row_of_slot[tok * 8 + k];\n        float s = 0.f;\n        if (rows[k] >= 0) {\n#pragma unroll\n            for (int j = 0; j < 4; ++j) {\n                const float4 y = out2[(size_t)rows[k] * 1024 + tid + 256 * j];\n                const float a = wf ? y.x * w[j].x : y.x, b = wf ? y.y * w[j].y : y.y, c = wf ? y.z * w[j].z : y.z, d = wf ? y.w * w[j].w : y.w;\n                s += a * a + b * b + c * c + d * d;\n            }\n        }\n        ss[k] = s;\n    }\n#pragma unroll\n    for (int k = 0; k < 8; ++k) {\n#pragma unroll\n        for (int o = 16; o > 0; o >>= 1) ss[k] += __shfl_xor_sync(0xffffffffu, ss[k], o);\n        if (lane == 0) red[wid][k] = ss[k];\n    }\n    __syncthreads();\n    float coef[8];\n#pragma unroll\n    for (int k = 0; k < 8; ++k) {\n        float t = 0.f;\n#pragma unroll\n        for (int i = 0; i < 8; ++i) t += red[i][k];\n        coef[k] = rows[k] >= 0 ? topk_w[tok * 8 + k] * rsqrtf(t / 4096.f + eps) : 0.f;\n    }\n#pragma unroll\n    for (int j = 0; j < 4; ++j) {\n        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);\n#pragma unroll\n        for (int k = 0; k < 8; ++k) {\n            if (rows[k] >= 0) {\n                const float4 y = out2[(size_t)rows[k] * 1024 + tid + 256 * j];\n                acc.x += y.x * coef[k];\n                acc.y += y.y * coef[k];\n                acc.z += y.z * coef[k];\n                acc.w += y.w * coef[k];\n            }\n        }\n        __nv_bfloat162 lo = __floats2bfloat162_rn(acc.x * w[j].x, acc.y * w[j].y), hi = __floats2bfloat162_rn(acc.z * w[j].z, acc.w * w[j].w);\n        uint2 packed;\n        packed.x = *reinterpret_cast<uint32_t*>(&lo);\n        packed.y = *reinterpret_cast<uint32_t*>(&hi);\n        *reinterpret_cast<uint2*>(out + (size_t)tok * 4096 + (tid + 256 * j) * 4) = packed;\n    }\n}\n\nstatic const int MKP_G = 2, MKP_P = 4;\nstatic const int MKP_SMEM = 4 * MKP_G * MKP_P * 576 + MKP_G * MKP_P * 512;\n\nvoid mkp_init() {\n    cudaFuncSetAttribute(mkg_k<MKP_G, MKP_P>, cudaFuncAttributeMaxDynamicSharedMemorySize, MKP_SMEM);\n    cudaFuncSetAttribute(mkg_k<MKP_G, MKP_P>, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxShared);\n}\n\nvoid mkp_route(torch::Tensor ids, torch::Tensor local_ids, torch::Tensor ctl, torch::Tensor gtab, torch::Tensor slot_of_row, torch::Tensor row_of_slot,\n               int64_t n_slots, int64_t lo, int64_t hi) {\n    auto st = at::cuda::getCurrentCUDAStream();\n    mkp_route_k<<<1, 1024, 0, st>>>(ids.data_ptr<int>(), local_ids.data_ptr<int>(), ctl.data_ptr<int>(), gtab.data_ptr<int>(),\n                                    slot_of_row.data_ptr<int>(), row_of_slot.data_ptr<int>(), (int)n_slots, (int)lo, (int)hi);\n}\n\nvoid mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor out1, torch::Tensor out2, torch::Tensor slot_of_row, torch::Tensor ctl,\n                int64_t max_rows) {\n    auto st = at::cuda::getCurrentCUDAStream();\n    mkp_gather_k<<<(int)max_rows, 256, 0, st>>>(reinterpret_cast<const uint4*>(x.data_ptr<at::BFloat16>()), reinterpret_cast<uint4*>(xg.data_ptr<at::BFloat16>()),\n                                                reinterpret_cast<float4*>(out1.data_ptr<float>()), reinterpret_cast<float4*>(out2.data_ptr<float>()),\n                                                slot_of_row.data_ptr<int>(), ctl.data_ptr<int>());\n}\n\nvoid mkp_act(torch::Tensor out1, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows) {\n    auto st = at::cuda::getCurrentCUDAStream();\n    mkp_act_k<<<(int)max_rows, 256, 0, st>>>(reinterpret_cast<const float4*>(out1.data_ptr<float>()),\n                                             reinterpret_cast<__nv_bfloat162*>(inter.data_ptr<at::BFloat16>()), ctl.data_ptr<int>());\n}\n\n\nvoid mkp_epi(torch::Tensor out2, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf) {\n    auto st = at::cuda::getCurrentCUDAStream();\n    mkp_epi_k<<<(int)m, 256, 0, st>>>(reinterpret_cast<const float4*>(out2.data_ptr<float>()), row_of_slot.data_ptr<int>(), topk_w.data_ptr<float>(),\n                                      reinterpret_cast<const __nv_bfloat16*>(norm_w.data_ptr<at::BFloat16>()), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),\n                                      (float)eps, (int)wf);\n}\n\n// max_groups: worst-case group count for the call\'s M (shape only); warps beyond the device-side n_groups exit at once.\nvoid mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor gsc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out,\n              int64_t max_groups, int64_t K, int64_t N, int64_t KS) {\n    const int items = (int)(max_groups * KS * (N / 64));\n    const int blocks = (items + 3) / 4;\n    auto st = at::cuda::getCurrentCUDAStream();\n    mkg_k<MKP_G, MKP_P><<<blocks, 128, MKP_SMEM, st>>>(reinterpret_cast<const uint4*>(W.data_ptr<int>()),\n                                                       reinterpret_cast<const uint2*>(Sc.data_ptr<uint8_t>()), gsc.data_ptr<float>(),\n                                                       reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), gtab.data_ptr<int>(),\n                                                       out.data_ptr<float>(), ctl.data_ptr<int>(), (int)K, (int)N, (int)KS);\n}\n"""\n\n# (largest M, K split): shape only; more splits for fewer groups.\n_MK_KS = ((1, 16), (16, 8), (32, 4), (None, 2))\n_MK_EXT = {}\n\n\ndef _mk_ext():\n    key = hashlib.sha1((_MK_CPP + _MK_CUDA).encode()).hexdigest()[:12]\n    if key not in _MK_EXT:\n        from torch.utils.cpp_extension import load_inline\n\n        ext = load_inline(\n            name=f"muse_mk_moe_{key}",\n            cpp_sources=_MK_CPP,\n            cuda_sources=_MK_CUDA,\n            functions=["mkp_init", "mkp_route", "mkp_gather", "mkp_act", "mkp_epi", "mkp_gemm"],\n            extra_cuda_cflags=["-O3"],\n            verbose=False,\n        )\n        ext.mkp_init()\n        _MK_EXT[key] = ext\n    return _MK_EXT[key]\n\n\ndef _mk_ks(m):\n    for top, ks in _MK_KS:\n        if top is None or m <= top:\n            return ks\n\n\ndef _mk_max_groups(m):\n    rows = MK_TOP_K * m\n    return min(rows, 32 * ((m + 15) // 16), rows // 16 + 32)\n\n\nclass MkLayer:\n    """One MoE layer\'s Marlin tensors plus the fp32 global scales (skip-flop: the bf16 scale already carries 2^119)."""\n\n    __slots__ = ("w13", "w13_s", "w2", "w2_s", "gs13", "gs2")\n\n    def __init__(self, w13, w13_s, w13_gs, w2, w2_s, w2_gs):\n        assert w13.shape[1] * 16 == MK_HIDDEN and w13.shape[2] == 2 * 2 * MK_INTER, tuple(w13.shape)\n        assert w2.shape[1] * 16 == MK_INTER and w2.shape[2] == 2 * MK_HIDDEN, tuple(w2.shape)\n        assert w13.shape[0] == MK_EXPERTS and w2.shape[0] == MK_EXPERTS\n        assert w13_s.element_size() == 1 and w2_s.element_size() == 1\n        self.w13 = w13\n        self.w13_s = w13_s.view(torch.uint8)\n        self.w2 = w2\n        self.w2_s = w2_s.view(torch.uint8)\n        self.gs13 = w13_gs.reshape(MK_EXPERTS, -1)[:, 0].float().contiguous()\n        self.gs2 = w2_gs.reshape(MK_EXPERTS, -1)[:, 0].float().contiguous()\n\n\nclass MkMoE:\n    def __init__(self):\n        self.ext = None\n        self.buf = None\n\n    def build(self, device):\n        self.ext = _mk_ext()\n        return self\n\n    def alloc(self, max_tokens, top_k, hidden, inter, device):\n        assert top_k == MK_TOP_K and hidden == MK_HIDDEN and inter == MK_INTER and max_tokens <= MK_MAX_TOKENS\n        self.max_tokens = max_tokens\n        rmax = top_k * max_tokens\n        self.buf = {\n            "ctl": torch.zeros(4, dtype=torch.int32, device=device),\n            "local_ids": torch.zeros(rmax, dtype=torch.int32, device=device),\n            "gtab": torch.zeros(3 * (rmax // 16 + 64), dtype=torch.int32, device=device),\n            "slot_of_row": torch.zeros(rmax, dtype=torch.int32, device=device),\n            "row_of_slot": torch.zeros(rmax, dtype=torch.int32, device=device),\n            "xg": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),\n            "out1": torch.zeros(rmax, 2 * inter, dtype=torch.float32, device=device),\n            "inter": torch.zeros(rmax, inter, dtype=torch.bfloat16, device=device),\n            "out2": torch.zeros(rmax, hidden, dtype=torch.float32, device=device),\n        }\n        return self\n\n    def bind_layer(self, w13, w13_s, w13_gs, w2, w2_s, w2_gs):\n        return MkLayer(w13, w13_s, w13_gs, w2, w2_s, w2_gs)\n\n    def forward(self, hidden_states, topk_ids, topk_weights, local_offset, local_count, layer, norm_weight, norm_eps, weight_first):\n        """hidden_states bf16 [M, 4096]; topk_ids int [M, 8] global ids; topk_weights [M, 8]; norm_weight bf16 [4096] (effective weight).\n\n        Returns bf16 [M, 4096] = sum_k s_k * post_norm(expert_k(x)), with the norm form selected by weight_first\n        (True: rms_norm(w * y), False: rms_norm(y) * w); routes to experts outside [local_offset, local_offset + local_count) are dropped.\n        """\n        e, b = self.ext, self.buf\n        x = hidden_states.contiguous()\n        m = x.shape[0]\n        assert m <= self.max_tokens and local_count <= MK_EXPERTS\n        n_slots = m * MK_TOP_K\n        ng = _mk_max_groups(m)\n        ks = _mk_ks(m)\n        e.mkp_route(topk_ids.to(torch.int32).contiguous(), b["local_ids"], b["ctl"], b["gtab"], b["slot_of_row"], b["row_of_slot"], n_slots,\n                    local_offset, local_offset + local_count)\n        e.mkp_gather(x, b["xg"], b["out1"], b["out2"], b["slot_of_row"], b["ctl"], n_slots)\n        e.mkp_gemm(layer.w13, layer.w13_s, layer.gs13, b["xg"], b["gtab"], b["ctl"], b["out1"], ng, MK_HIDDEN, 2 * MK_INTER, ks)\n        e.mkp_act(b["out1"], b["inter"], b["ctl"], n_slots)\n        e.mkp_gemm(layer.w2, layer.w2_s, layer.gs2, b["inter"], b["gtab"], b["ctl"], b["out2"], ng, MK_INTER, MK_HIDDEN, ks)\n        out = torch.empty((m, MK_HIDDEN), dtype=torch.bfloat16, device=x.device)\n        e.mkp_epi(b["out2"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0)\n        return out\n\n\n_MK_SHARED = {}\n\n\ndef mk_shared(device):\n    """One MkMoE (compiled module and buffers) per device, shared by all layers: layers run one after the other on a stream."""\n    key = (device.type, device.index)\n    if key not in _MK_SHARED:\n        _MK_SHARED[key] = MkMoE().build(device).alloc(MK_MAX_TOKENS, MK_TOP_K, MK_HIDDEN, MK_INTER, device)\n    return _MK_SHARED[key]\n'
-
 _MKNUM_CASES = (
     (1, [1, 1, 1]),
     (8, [6, 3, 2, 1, 1]),
@@ -919,33 +949,124 @@ def _cmp(a, b):
     return bool(torch.equal(a, b)), float(d.norm() / b.norm().clamp(min=1e-9)), float(d.abs().max())
 
 
+def _serving_stock(data, state, stages=False):
+    """SGLang's _marlin_expert_outputs + fused post-norm exactly as serving calls them (no atomics, fp32 reduce, global-id align with expert_map)."""
+    cfg = data["config"]
+    bank = state["banks"][(0, 32)]
+    x = data["hidden_states"].contiguous()
+    m, size_k = x.shape
+    size_n = bank["size_n"]
+    gemm1_n = 2 * size_n
+    local_ids = local_ids_triton(data["topk_ids"], cfg["local_start"], cfg["local_count"])
+    topk_weights = data["topk_weights"].to(torch.float32).contiguous()
+    bm = 64
+    for cand in (8, 16, 32, 48, 64):
+        if m * 8 / 32 / cand < 0.9:
+            bm = cand
+            break
+    sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, bm, 256)
+    cache2 = torch.empty((m * 8, size_n), device=x.device, dtype=x.dtype)
+    cache13 = torch.empty((m * 8 * max(gemm1_n, size_k),), device=x.device, dtype=x.dtype)
+    cache1 = cache13[: m * 8 * gemm1_n].view(-1, gemm1_n)
+    cache3 = cache13[: m * 8 * size_k].view(-1, size_k)
+    common = dict(moe_block_size=bm, mul_topk_weights=False, is_ep=True, b_q_type=scalar_types.float4_e2m1f, is_k_full=True, is_zp_float=False,
+                  use_atomic_add=False, use_fp32_reduce=True)
+    ws = state["workspace"]
+    cache1 = moe_wna16_marlin_gemm(x, cache1, bank["w13"], None, bank["w13_s"], bank["w13_gs"], None, None, None, ws, sorted_ids, block_experts, n_padded,
+                                   topk_weights, top_k=8, size_m=m, size_n=gemm1_n, size_k=size_k, **common)
+    c1 = cache1.clone() if stages else None
+    silu_and_mul(cache1.view(-1, gemm1_n), cache2, expert_ids=local_ids.view(-1), expert_step=1)
+    c2 = cache2.clone() if stages else None
+    y = moe_wna16_marlin_gemm(cache2, cache3, bank["w2"], None, bank["w2_s"], bank["w2_gs"], None, None, None, ws, sorted_ids, block_experts, n_padded,
+                              topk_weights, top_k=1, size_m=m * 8, size_n=size_k, size_k=size_n, **common).view(m, 8, size_k)
+    out = fused_post_expert_norm_weighted_sum(y, topk_weights, norm_weight=state["norm_w"], eps=POST_NORM_EPS, weight_first=True, slot_expert_ids=local_ids)
+    if stages:
+        return out, c1, c2, y.clone(), local_ids
+    return out
+
+
+def _mk_stages(mk, lw, x, ids):
+    e, b = mk.ext, mk.buf
+    m = x.shape[0]
+    n = m * 8
+    ng, ks = _mk_max_groups(m), _mk_ks(m)
+    k1, k2 = n * 8192, n * 4096
+    e.mkp_route(ids.to(torch.int32).contiguous(), b["local_ids"], b["ctl"], b["gtab"], b["slot_of_row"], b["row_of_slot"], n, 0, 32)
+    e.mkp_gather(x.contiguous(), b["xg"], b["slot_of_row"], b["ctl"], n)
+    e.mkp_gemm(lw.w13, lw.w13_s, lw.gs13, b["xg"], b["gtab"], b["ctl"], b["part"], ng, 4096, 8192, ks, k1)
+    p1 = b["part"][: ks * k1].view(ks, n, 8192)
+    c1 = p1[0].clone()
+    for s in range(1, ks):
+        c1 = c1 + p1[s]
+    c1f = c1
+    c1 = c1.to(torch.bfloat16)
+    e.mkp_act(b["part"], b["inter"], b["ctl"], n, ks, k1)
+    c2 = b["inter"][:n].clone()
+    e.mkp_gemm(lw.w2, lw.w2_s, lw.gs2, b["inter"], b["gtab"], b["ctl"], b["part"], ng, 4096, 4096, ks, k2)
+    p2 = b["part"][: ks * k2].view(ks, n, 4096)
+    y = p2[0].clone()
+    for s in range(1, ks):
+        y = y + p2[s]
+    return b["row_of_slot"][:n].clone(), c1, c2, y.to(torch.bfloat16), c1f
+
+
+def _unit_err(a, ref):
+    a, ref = a.float().reshape(-1), ref.float().reshape(-1)
+    return float((a / a.norm() - ref / ref.norm()).norm())
+
+
+def _mk_stage_report(mk, lw, state, weights, data, m):
+    x, ids = data["hidden_states"], data["topk_ids"]
+    _, s1, s2, sy, lids = _serving_stock(data, state, stages=True)
+    rows, o1, o2, oy, o1f = _mk_stages(mk, lw, x, ids)
+    live = (rows >= 0).nonzero().view(-1)
+    ro = rows[live]
+    d = {}
+    for name, so, oo in (("c1", s1[live], o1[ro]), ("silu", s2[live], o2[ro]), ("y", sy.view(m * 8, -1)[live], oy[ro])):
+        eq = float((so.float() == oo.float()).float().mean())
+        d[name] = f"{float((so.float() - oo.float()).norm() / so.float().norm()):.1e}/eq{eq:.2f}"
+    # true fp32 reference for GEMM1 on the live slots of up to 3 experts
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device=x.device)
+    exps = lids.view(-1)[live].unique()[:3]
+    refs, refs16, sel = [], [], []
+    for ex in exps.tolist():
+        wr = weights["w13"][ex]
+        q = lut[torch.stack([(wr & 15).long(), (wr >> 4).long()], -1).reshape(wr.shape[0], -1)]
+        sc = q * weights["w13_sf"][ex].float().repeat_interleave(16, dim=1)
+        wt = sc * weights["w13_gs"][ex].float()
+        wt16 = sc * weights["w13_gs"][ex].float().to(torch.bfloat16).float()
+        slots = (lids.view(-1) == ex).nonzero().view(-1)
+        refs.append(x[slots // 8].float() @ wt.t())
+        refs16.append(x[slots // 8].float() @ wt16.t())
+        sel.append(slots)
+    slots = torch.cat(sel)
+    ref = torch.cat(refs)
+    ref16 = torch.cat(refs16)
+    pos = {int(s): i for i, s in enumerate(live.tolist())}
+    idx = torch.tensor([pos[int(s)] for s in slots.tolist()], device=x.device)
+    d["truth_c1_stock"] = f"{_unit_err(s1[live][idx], ref):.1e}"
+    d["truth_c1_ours"] = f"{_unit_err(o1[ro][idx], ref):.1e}"
+    d["t16"] = f"stock={_unit_err(s1[live][idx], ref16):.1e} ours_bf16={_unit_err(o1[ro][idx], ref16):.1e} ours_fp32={_unit_err(o1f[ro][idx], ref16):.1e}"
+    print(f"MKNUM-STAGE M={m} ours_vs_stock c1={d['c1']} silu={d['silu']} y={d['y']} | unit-norm error vs fp32 truth (GEMM1, {len(slots)} slots): stock={d['truth_c1_stock']} ours={d['truth_c1_ours']} | vs truth with Marlin's bf16 global scale: {d['t16']}", flush=True)
+
+
 def _mk_numcheck(state, weights):
     mk, lw, nw = state["mk"], state["mk_layer"], state["norm_w"]
     dev = nw.device
-    ns = {}
-    exec(compile(_MK_V0_SRC, "mk_moe_v0", "exec"), ns)
-    old = ns["MkMoE"]().build(dev).alloc(256, 8, 4096, 4096, dev)
-    bank = state["banks"][(0, 32)]
-    lw0 = old.bind_layer(bank["w13"], bank["w13_s"], bank["w13_gs"], bank["w2"], bank["w2_s"], bank["w2_gs"])
-    print(f"MKNUM scratch new={mk.scratch_bytes() / 2**20:.0f}MB old={sum(t.numel() * t.element_size() for t in old.buf.values()) / 2**20:.0f}MB", flush=True)
+    print(f"MKNUM scratch new={mk.scratch_bytes() / 2**20:.0f}MB", flush=True)
     for m, counts in _MKNUM_CASES:
         data = _mknum_inputs(m, counts, dev, 5)
-        x, ids, w, cfg = data["hidden_states"], data["topk_ids"], data["topk_weights"], data["config"]
-        st1 = _kernel_sglang(data, state).clone()
-        st2 = _kernel_sglang(data, state).clone()
+        x, ids, w = data["hidden_states"], data["topk_ids"], data["topk_weights"]
+        st1 = _serving_stock(data, state).clone()
+        st2 = _serving_stock(data, state).clone()
         n1 = mk.forward(x, ids, w, 0, 32, lw, nw, POST_NORM_EPS, True).clone()
         n2 = mk.forward(x, ids, w, 0, 32, lw, nw, POST_NORM_EPS, True).clone()
-        o1 = old.forward(x, ids, w, 0, 32, lw0, nw, POST_NORM_EPS, True).clone()
-        o2 = old.forward(x, ids, w, 0, 32, lw0, nw, POST_NORM_EPS, True).clone()
         torch.cuda.synchronize()
-        nv = _cmp(n1, st1)
-        ov = _cmp(o1, st1)
-        ss = _cmp(st1, st2)
-        nn_ = _cmp(n1, n2)
-        oo = _cmp(o1, o2)
+        nv, ss, nn_ = _cmp(n1, st1), _cmp(st1, st2), _cmp(n1, n2)
         frac = float((n1.float() != st1.float()).float().mean())
-        print(f"MKNUM M={m} new_vs_stock rel={nv[1]:.2e} max={nv[2]:.1e} diff_frac={frac:.3f} | old_vs_stock rel={ov[1]:.2e} max={ov[2]:.1e} | stock_vs_stock eq={ss[0]} rel={ss[1]:.1e}"
-              f" | new_vs_new eq={nn_[0]} rel={nn_[1]:.1e} | old_vs_old eq={oo[0]} rel={oo[1]:.1e}", flush=True)
+        print(f"MKNUM M={m} new_vs_servingstock rel={nv[1]:.2e} max={nv[2]:.1e} diff_frac={frac:.3f} | stock_vs_stock eq={ss[0]} rel={ss[1]:.1e} | new_vs_new eq={nn_[0]} rel={nn_[1]:.1e}", flush=True)
+        if m in (8, 128):
+            _mk_stage_report(mk, lw, state, weights, data, m)
 
 
 # ============================================================================================ entry

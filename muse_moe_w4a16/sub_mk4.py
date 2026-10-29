@@ -360,7 +360,8 @@ MK_EXPERTS = 32
 _MK_CPP = r"""#include <torch/extension.h>
 void mkp_init();
 void mkp_route(torch::Tensor ids, torch::Tensor local_ids, torch::Tensor ctl, torch::Tensor gtab, torch::Tensor slot_of_row, torch::Tensor row_of_slot, int64_t n_slots, int64_t lo, int64_t hi);
-void mkp_epi(torch::Tensor part, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf, int64_t ks, int64_t ksw);
+void mkp_reduce(torch::Tensor part, torch::Tensor y, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw);
+void mkp_epi(torch::Tensor y, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf);
 void mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor slot_of_row, torch::Tensor ctl, int64_t max_rows);
 void mkp_act(torch::Tensor part, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw);
 void mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor gsc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out, int64_t max_groups, int64_t K, int64_t N, int64_t KS, int64_t ksw);
@@ -604,16 +605,30 @@ __global__ void __launch_bounds__(256) mkp_gather_k(const uint4* __restrict__ x,
 __device__ __forceinline__ float mkp_rb(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
 // Sum of the KS partials of 4 consecutive floats, in slice order, rounded to bf16 (what stock Marlin's fp32-reduce GEMM stores).
+// The plane loads are issued 8 at a time (independent) and added in order, so the sum is the same as a serial loop.
 __device__ __forceinline__ float4 mkp_sum4(const float4* __restrict__ part, size_t idx, size_t ks_stride4, int ks) {
     float4 a = part[idx];
-    for (int s = 1; s < ks; ++s) {
-        const float4 b = part[idx + (size_t)s * ks_stride4];
-        a.x += b.x;
-        a.y += b.y;
-        a.z += b.z;
-        a.w += b.w;
+    for (int s0 = 1; s0 < ks; s0 += 8) {
+        float4 v[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t) v[t] = (s0 + t < ks) ? part[idx + (size_t)(s0 + t) * ks_stride4] : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (s0 + t < ks) {
+                a.x += v[t].x;
+                a.y += v[t].y;
+                a.z += v[t].z;
+                a.w += v[t].w;
+            }
+        }
     }
     return make_float4(mkp_rb(a.x), mkp_rb(a.y), mkp_rb(a.z), mkp_rb(a.w));
+}
+
+__device__ __forceinline__ float4 mkp_ld4(const uint2* __restrict__ yb, size_t idx) {
+    const uint2 raw = yb[idx];
+    const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x), b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+    return make_float4(__low2float(a), __high2float(a), __low2float(b), __high2float(b));
 }
 
 // silu_and_mul as stock builds it for sm90 (fast math): bf16 gate and up in, fp32 silu(gate) * up, one bf16 rounding.
@@ -625,24 +640,34 @@ __global__ void __launch_bounds__(256) mkp_act_k(const float4* __restrict__ part
     const int r = blockIdx.x;
     if (r >= ctl[0]) return;
     const size_t ks4 = ksw / 4;
-    for (int i = threadIdx.x; i < 1024; i += 256) {
-        const float4 g = mkp_sum4(part, (size_t)r * 2048 + i, ks4, ks);
-        const float4 u = mkp_sum4(part, (size_t)r * 2048 + 1024 + i, ks4, ks);
-        inter[(size_t)r * 2048 + 2 * i] = __floats2bfloat162_rn(mkp_silu_mul(g.x, u.x), mkp_silu_mul(g.y, u.y));
-        inter[(size_t)r * 2048 + 2 * i + 1] = __floats2bfloat162_rn(mkp_silu_mul(g.z, u.z), mkp_silu_mul(g.w, u.w));
-    }
+    const int i = blockIdx.y * 256 + threadIdx.x;  // grid (rows, 4): 1024 float4 per row
+    const float4 g = mkp_sum4(part, (size_t)r * 2048 + i, ks4, ks);
+    const float4 u = mkp_sum4(part, (size_t)r * 2048 + 1024 + i, ks4, ks);
+    inter[(size_t)r * 2048 + 2 * i] = __floats2bfloat162_rn(mkp_silu_mul(g.x, u.x), mkp_silu_mul(g.y, u.y));
+    inter[(size_t)r * 2048 + 2 * i + 1] = __floats2bfloat162_rn(mkp_silu_mul(g.z, u.z), mkp_silu_mul(g.w, u.w));
+}
+
+// y[r] = bf16(sum of the GEMM2 partials), dense [rows, 4096]; grid (rows, 4).
+__global__ void __launch_bounds__(256) mkp_red_k(const float4* __restrict__ part, uint2* __restrict__ y, const int* __restrict__ ctl, int ks, size_t ksw) {
+    const int r = blockIdx.x;
+    if (r >= ctl[0]) return;
+    const int i = blockIdx.y * 256 + threadIdx.x;
+    const float4 v = mkp_sum4(part, (size_t)r * 1024 + i, ksw / 4, ks);
+    __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+    uint2 packed;
+    packed.x = *reinterpret_cast<uint32_t*>(&lo);
+    packed.y = *reinterpret_cast<uint32_t*>(&hi);
+    y[(size_t)r * 1024 + i] = packed;
 }
 
 
 // Fused scatter + post-expert norm + weighted sum, per slot in fp32 like stock's fused kernel:
 //   weight_first: y = (x * w) * rsqrt(mean((x * w)^2) + eps);  otherwise y = (x * rsqrt(mean(x^2) + eps)) * w;  out = bf16(sum over live k ascending of y * s_k).
-// x = bf16(sum of the GEMM2 partials) of the route's row.
-__global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ part, const int* __restrict__ row_of_slot, const float* __restrict__ topk_w,
-                                                 const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ out, float eps, int wf, int ks,
-                                                 size_t ksw) {
+// x = the bf16 GEMM2 output row of the route (written by mkp_red_k).
+__global__ void __launch_bounds__(256) mkp_epi_k(const uint2* __restrict__ yb, const int* __restrict__ row_of_slot, const float* __restrict__ topk_w,
+                                                 const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ out, float eps, int wf) {
     __shared__ float red[8][8];
     const int tok = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-    const size_t ks4 = ksw / 4;
     int rows[8];
     float ss[8];
     float4 w[4];
@@ -659,7 +684,7 @@ __global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ part
         if (rows[k] >= 0) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const float4 y = mkp_sum4(part, (size_t)rows[k] * 1024 + tid + 256 * j, ks4, ks);
+                const float4 y = mkp_ld4(yb, (size_t)rows[k] * 1024 + tid + 256 * j);
                 const float a = wf ? y.x * w[j].x : y.x, b = wf ? y.y * w[j].y : y.y, c = wf ? y.z * w[j].z : y.z, d = wf ? y.w * w[j].w : y.w;
                 s += a * a + b * b + c * c + d * d;
             }
@@ -687,7 +712,7 @@ __global__ void __launch_bounds__(256) mkp_epi_k(const float4* __restrict__ part
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
             if (rows[k] >= 0) {
-                const float4 y = mkp_sum4(part, (size_t)rows[k] * 1024 + tid + 256 * j, ks4, ks);
+                const float4 y = mkp_ld4(yb, (size_t)rows[k] * 1024 + tid + 256 * j);
                 const float sk = topk_w[tok * 8 + k];
                 if (wf) {
                     acc.x += (y.x * w[j].x * rinv[k]) * sk;
@@ -733,16 +758,21 @@ void mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor slot_of_row, to
 
 void mkp_act(torch::Tensor part, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw) {
     auto st = at::cuda::getCurrentCUDAStream();
-    mkp_act_k<<<(int)max_rows, 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()),
+    mkp_act_k<<<dim3((unsigned)max_rows, 4), 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()),
                                              reinterpret_cast<__nv_bfloat162*>(inter.data_ptr<at::BFloat16>()), ctl.data_ptr<int>(), (int)ks, (size_t)ksw);
 }
 
-void mkp_epi(torch::Tensor part, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf,
-             int64_t ks, int64_t ksw) {
+void mkp_reduce(torch::Tensor part, torch::Tensor y, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw) {
     auto st = at::cuda::getCurrentCUDAStream();
-    mkp_epi_k<<<(int)m, 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()), row_of_slot.data_ptr<int>(), topk_w.data_ptr<float>(),
+    mkp_red_k<<<dim3((unsigned)max_rows, 4), 256, 0, st>>>(reinterpret_cast<const float4*>(part.data_ptr<float>()), reinterpret_cast<uint2*>(y.data_ptr<at::BFloat16>()),
+                                                           ctl.data_ptr<int>(), (int)ks, (size_t)ksw);
+}
+
+void mkp_epi(torch::Tensor y, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    mkp_epi_k<<<(int)m, 256, 0, st>>>(reinterpret_cast<const uint2*>(y.data_ptr<at::BFloat16>()), row_of_slot.data_ptr<int>(), topk_w.data_ptr<float>(),
                                       reinterpret_cast<const __nv_bfloat16*>(norm_w.data_ptr<at::BFloat16>()), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-                                      (float)eps, (int)wf, (int)ks, (size_t)ksw);
+                                      (float)eps, (int)wf);
 }
 
 // max_groups: worst-case group count for the call's M (shape only); warps beyond the device-side n_groups exit at once.
@@ -772,7 +802,7 @@ def _mk_ext():
             name=f"muse_mk_moe_{key}",
             cpp_sources=_MK_CPP,
             cuda_sources=_MK_CUDA,
-            functions=["mkp_init", "mkp_route", "mkp_gather", "mkp_act", "mkp_epi", "mkp_gemm"],
+            functions=["mkp_init", "mkp_route", "mkp_gather", "mkp_act", "mkp_reduce", "mkp_epi", "mkp_gemm"],
             extra_cuda_cflags=["-O3"],
             verbose=False,
         )
@@ -831,6 +861,7 @@ class MkMoE:
             "row_of_slot": torch.zeros(rmax, dtype=torch.int32, device=device),
             "xg": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),
             "inter": torch.zeros(rmax, inter, dtype=torch.bfloat16, device=device),
+            "y": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),
             # fp32 split-K partials [KS, 8 * M, N] of the call in flight; GEMM2 reuses GEMM1's after the activation has consumed them
             "part": torch.zeros(max(_mk_ks(m) * top_k * m for m in range(1, max_tokens + 1)) * 2 * inter, dtype=torch.float32, device=device),
         }
@@ -863,8 +894,9 @@ class MkMoE:
         e.mkp_gemm(layer.w13, layer.w13_s, layer.gs13, b["xg"], b["gtab"], b["ctl"], b["part"], ng, MK_HIDDEN, 2 * MK_INTER, ks, ksw1)
         e.mkp_act(b["part"], b["inter"], b["ctl"], n_slots, ks, ksw1)
         e.mkp_gemm(layer.w2, layer.w2_s, layer.gs2, b["inter"], b["gtab"], b["ctl"], b["part"], ng, MK_INTER, MK_HIDDEN, ks, ksw2)
+        e.mkp_reduce(b["part"], b["y"], b["ctl"], n_slots, ks, ksw2)
         out = torch.empty((m, MK_HIDDEN), dtype=torch.bfloat16, device=x.device)
-        e.mkp_epi(b["part"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0, ks, ksw2)
+        e.mkp_epi(b["y"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0)
         return out
 
 

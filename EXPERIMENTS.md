@@ -233,3 +233,24 @@ Expect: new_vs_new bitwise equal at every M; new_vs_stock rel L2 well below old 
 Speed within ~3% of sub_mk3 (overall 1.393x): the GEMM epilogue now stores instead of atomics and the zeroing is gone, so it may be slightly faster; consumers re-read KS planes (M=1: 16).
 Decisions: new_vs_new bitwise and new_vs_stock <= old and within about 2x stock_vs_stock -> check 2 (clean sub_mk4); not deterministic -> look for a race (e.g. partial planes overlapping, KS plane stride);
 new_vs_stock not better than old -> the rounding points differ from stock: inspect which stage (compare intermediates) before spending check 2.
+RESULT check 1, job e029437b9fb44025 (measure_mk4_num.py; official 5/5 pass). MKNUM (stock = v1 _kernel_sglang with v1's tuned config, NOT the serving config):
+new_vs_new bitwise equal at all M (old_vs_old not for M=8/16/32). new_vs_stock rel 6.8e-3 (M1) 5.7e-3 (8,16,32,128,256) vs old_vs_stock 6.6e-3 / 5.5e-3: NO improvement; diff_frac 0.56-0.75 of output elements differ. stock_vs_stock bitwise
+equal except M=1 (rel 4.0e-3, v1 uses atomic reduce there) and M=256 (6.7e-5). scratch: new 160 MB, old 128 MB.
+SPEED REGRESSION at small M in this job: decode1 0.742x (104.6 us), decode16 0.982x, decode32 0.974x, verify1 0.966x; verify16 1.432x, verify32 1.481x (sub_mk3: 1.70 / 1.29 / 1.09 / 1.37 / 1.49 / 1.48).
+Reading: (1) determinism achieved. (2) matching stock's rounding points did not reduce the difference to stock, so the 5.7e-3 is not rounding: some systematic difference. Unknown which stage: need stage-wise compare
+(GEMM1 bf16 output, silu*mul output, GEMM2 bf16 output) against the SERVING stock config (atomic False, fp32 reduce True, serving block-size rule, align with 256 experts) AND against a true fp32 dequant reference
+(who is closer to the truth?). (3) Small-M slowdown = the consumers (act, epilogue) add KS planes (KS 16 at M=1) with a serial dependent-free loop that is not unrolled: latency bound, 2 passes. Fix: batch the plane loads
+(same summation order).
+Check 2 of <=3 (measure_mk4_num.py again, new study): Q: which stage differs from serving stock and who is nearer the fp32 truth; does batched plane loading restore small-M speed?
+Expect: speed back to within ~3% of sub_mk3 for M<=32. Stage table: if c1 (GEMM1 bf16) differs from stock by ~5e-3 while both are ~equally far from truth -> Marlin's own numerics (e.g. fp16-style or per-group
+rescale ordering) differ; if ours is much closer to truth than stock -> stock has the error and exact parity needs mimicking it.
+Decision: stage that diverges first tells what to mimic; if truth-error of stock is ~5e-3 and ours ~2e-3, parity with stock at < 1e-3 is out of reach without reproducing Marlin's exact arithmetic -> report that (and the risk) instead of chasing it.
+RESULT check 2, job eb13b2af5c23469d (measure_mk4_num.py, stage study vs SERVING stock = no atomics, fp32 reduce, global-id align): official 5/5. Speed still bad at small M: decode1 0.757x (102.4 us), decode16 1.025, decode32 0.977,
+verify1 1.035, verify16 1.435, verify32 1.471. Profile (GPU us) decode1: mkp_epi 41.0, mkg 27.9, mkp_act 12.5; decode16: mkg 111.2, epi 30.0, act 13.2 -> the CONSUMERS are the cost (one block summing 16 planes, chained latencies).
+MKNUM vs serving stock: serving stock is BITWISE deterministic (stock_vs_stock eq=True) for M<=128 (M=256: rel 1.3e-4); new_vs_new bitwise at every M; new_vs_servingstock rel 5.7e-3..6.1e-3, 56-73% of output elements differ.
+STAGES (M=8 and M=128 identical): ours-vs-stock GEMM1 bf16 output rel 2.8e-3 (73% elements equal), after silu*mul 4.6e-3 (62% equal), GEMM2 bf16 output 5.4e-3 (30% equal).
+Unit-norm error vs fp32 truth (GEMM1, fp32 global scale): stock 2.4e-3, ours 1.7e-3 -> ours is nearer the truth than stock; the difference to stock is stock's own arithmetic.
+Reading: rounding points were not the cause; the stages differ already at GEMM1 (27% of bf16 elements one ulp off = fp32 values differ ~5e-4). Check 3 (last allowed by the plan): parallel plane reduction
+(act grid (rows,4) with all plane loads in flight; a small reduce kernel writing dense bf16 y; epilogue reads bf16 y) to restore small-M speed, and the truth study repeated with Marlin's bf16-rounded global scale
+(separates the common scale rounding from real arithmetic differences) incl. our fp32 GEMM1 sum before rounding.
+Expect: speed back within ~3% of sub_mk3 (decode1 ~1.7, decode16 ~1.29, decode32 ~1.09, verify1 ~1.37, verify16/32 ~1.49); ours_fp32 vs truth(bf16 gs) ~1e-6..1e-4 if our GEMM is exact; stock vs truth(bf16 gs) tells stock's extra error.

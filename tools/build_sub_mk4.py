@@ -78,8 +78,6 @@ selfcheck = '''
 selfcheck_fn = '''
 
 # ---- CHECK-only numerics study (never part of a submitted file). The v0 module (before numerics parity) is embedded as text.
-_MK_V0_SRC = __V0__
-
 _MKNUM_CASES = (
     (1, [1, 1, 1]),
     (8, [6, 3, 2, 1, 1]),
@@ -117,34 +115,125 @@ def _cmp(a, b):
     return bool(torch.equal(a, b)), float(d.norm() / b.norm().clamp(min=1e-9)), float(d.abs().max())
 
 
+def _serving_stock(data, state, stages=False):
+    """SGLang's _marlin_expert_outputs + fused post-norm exactly as serving calls them (no atomics, fp32 reduce, global-id align with expert_map)."""
+    cfg = data["config"]
+    bank = state["banks"][(0, 32)]
+    x = data["hidden_states"].contiguous()
+    m, size_k = x.shape
+    size_n = bank["size_n"]
+    gemm1_n = 2 * size_n
+    local_ids = local_ids_triton(data["topk_ids"], cfg["local_start"], cfg["local_count"])
+    topk_weights = data["topk_weights"].to(torch.float32).contiguous()
+    bm = 64
+    for cand in (8, 16, 32, 48, 64):
+        if m * 8 / 32 / cand < 0.9:
+            bm = cand
+            break
+    sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, bm, 256)
+    cache2 = torch.empty((m * 8, size_n), device=x.device, dtype=x.dtype)
+    cache13 = torch.empty((m * 8 * max(gemm1_n, size_k),), device=x.device, dtype=x.dtype)
+    cache1 = cache13[: m * 8 * gemm1_n].view(-1, gemm1_n)
+    cache3 = cache13[: m * 8 * size_k].view(-1, size_k)
+    common = dict(moe_block_size=bm, mul_topk_weights=False, is_ep=True, b_q_type=scalar_types.float4_e2m1f, is_k_full=True, is_zp_float=False,
+                  use_atomic_add=False, use_fp32_reduce=True)
+    ws = state["workspace"]
+    cache1 = moe_wna16_marlin_gemm(x, cache1, bank["w13"], None, bank["w13_s"], bank["w13_gs"], None, None, None, ws, sorted_ids, block_experts, n_padded,
+                                   topk_weights, top_k=8, size_m=m, size_n=gemm1_n, size_k=size_k, **common)
+    c1 = cache1.clone() if stages else None
+    silu_and_mul(cache1.view(-1, gemm1_n), cache2, expert_ids=local_ids.view(-1), expert_step=1)
+    c2 = cache2.clone() if stages else None
+    y = moe_wna16_marlin_gemm(cache2, cache3, bank["w2"], None, bank["w2_s"], bank["w2_gs"], None, None, None, ws, sorted_ids, block_experts, n_padded,
+                              topk_weights, top_k=1, size_m=m * 8, size_n=size_k, size_k=size_n, **common).view(m, 8, size_k)
+    out = fused_post_expert_norm_weighted_sum(y, topk_weights, norm_weight=state["norm_w"], eps=POST_NORM_EPS, weight_first=True, slot_expert_ids=local_ids)
+    if stages:
+        return out, c1, c2, y.clone(), local_ids
+    return out
+
+
+def _mk_stages(mk, lw, x, ids):
+    e, b = mk.ext, mk.buf
+    m = x.shape[0]
+    n = m * 8
+    ng, ks = _mk_max_groups(m), _mk_ks(m)
+    k1, k2 = n * 8192, n * 4096
+    e.mkp_route(ids.to(torch.int32).contiguous(), b["local_ids"], b["ctl"], b["gtab"], b["slot_of_row"], b["row_of_slot"], n, 0, 32)
+    e.mkp_gather(x.contiguous(), b["xg"], b["slot_of_row"], b["ctl"], n)
+    e.mkp_gemm(lw.w13, lw.w13_s, lw.gs13, b["xg"], b["gtab"], b["ctl"], b["part"], ng, 4096, 8192, ks, k1)
+    p1 = b["part"][: ks * k1].view(ks, n, 8192)
+    c1 = p1[0].clone()
+    for s in range(1, ks):
+        c1 = c1 + p1[s]
+    c1f = c1
+    c1 = c1.to(torch.bfloat16)
+    e.mkp_act(b["part"], b["inter"], b["ctl"], n, ks, k1)
+    c2 = b["inter"][:n].clone()
+    e.mkp_gemm(lw.w2, lw.w2_s, lw.gs2, b["inter"], b["gtab"], b["ctl"], b["part"], ng, 4096, 4096, ks, k2)
+    p2 = b["part"][: ks * k2].view(ks, n, 4096)
+    y = p2[0].clone()
+    for s in range(1, ks):
+        y = y + p2[s]
+    return b["row_of_slot"][:n].clone(), c1, c2, y.to(torch.bfloat16), c1f
+
+
+def _unit_err(a, ref):
+    a, ref = a.float().reshape(-1), ref.float().reshape(-1)
+    return float((a / a.norm() - ref / ref.norm()).norm())
+
+
+def _mk_stage_report(mk, lw, state, weights, data, m):
+    x, ids = data["hidden_states"], data["topk_ids"]
+    _, s1, s2, sy, lids = _serving_stock(data, state, stages=True)
+    rows, o1, o2, oy, o1f = _mk_stages(mk, lw, x, ids)
+    live = (rows >= 0).nonzero().view(-1)
+    ro = rows[live]
+    d = {}
+    for name, so, oo in (("c1", s1[live], o1[ro]), ("silu", s2[live], o2[ro]), ("y", sy.view(m * 8, -1)[live], oy[ro])):
+        eq = float((so.float() == oo.float()).float().mean())
+        d[name] = f"{float((so.float() - oo.float()).norm() / so.float().norm()):.1e}/eq{eq:.2f}"
+    # true fp32 reference for GEMM1 on the live slots of up to 3 experts
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device=x.device)
+    exps = lids.view(-1)[live].unique()[:3]
+    refs, refs16, sel = [], [], []
+    for ex in exps.tolist():
+        wr = weights["w13"][ex]
+        q = lut[torch.stack([(wr & 15).long(), (wr >> 4).long()], -1).reshape(wr.shape[0], -1)]
+        sc = q * weights["w13_sf"][ex].float().repeat_interleave(16, dim=1)
+        wt = sc * weights["w13_gs"][ex].float()
+        wt16 = sc * weights["w13_gs"][ex].float().to(torch.bfloat16).float()
+        slots = (lids.view(-1) == ex).nonzero().view(-1)
+        refs.append(x[slots // 8].float() @ wt.t())
+        refs16.append(x[slots // 8].float() @ wt16.t())
+        sel.append(slots)
+    slots = torch.cat(sel)
+    ref = torch.cat(refs)
+    ref16 = torch.cat(refs16)
+    pos = {int(s): i for i, s in enumerate(live.tolist())}
+    idx = torch.tensor([pos[int(s)] for s in slots.tolist()], device=x.device)
+    d["truth_c1_stock"] = f"{_unit_err(s1[live][idx], ref):.1e}"
+    d["truth_c1_ours"] = f"{_unit_err(o1[ro][idx], ref):.1e}"
+    d["t16"] = f"stock={_unit_err(s1[live][idx], ref16):.1e} ours_bf16={_unit_err(o1[ro][idx], ref16):.1e} ours_fp32={_unit_err(o1f[ro][idx], ref16):.1e}"
+    print(f"MKNUM-STAGE M={m} ours_vs_stock c1={d['c1']} silu={d['silu']} y={d['y']} | unit-norm error vs fp32 truth (GEMM1, {len(slots)} slots): stock={d['truth_c1_stock']} ours={d['truth_c1_ours']} | vs truth with Marlin's bf16 global scale: {d['t16']}", flush=True)
+
+
 def _mk_numcheck(state, weights):
     mk, lw, nw = state["mk"], state["mk_layer"], state["norm_w"]
     dev = nw.device
-    ns = {}
-    exec(compile(_MK_V0_SRC, "mk_moe_v0", "exec"), ns)
-    old = ns["MkMoE"]().build(dev).alloc(256, 8, 4096, 4096, dev)
-    bank = state["banks"][(0, 32)]
-    lw0 = old.bind_layer(bank["w13"], bank["w13_s"], bank["w13_gs"], bank["w2"], bank["w2_s"], bank["w2_gs"])
-    print(f"MKNUM scratch new={mk.scratch_bytes() / 2**20:.0f}MB old={sum(t.numel() * t.element_size() for t in old.buf.values()) / 2**20:.0f}MB", flush=True)
+    print(f"MKNUM scratch new={mk.scratch_bytes() / 2**20:.0f}MB", flush=True)
     for m, counts in _MKNUM_CASES:
         data = _mknum_inputs(m, counts, dev, 5)
-        x, ids, w, cfg = data["hidden_states"], data["topk_ids"], data["topk_weights"], data["config"]
-        st1 = _kernel_sglang(data, state).clone()
-        st2 = _kernel_sglang(data, state).clone()
+        x, ids, w = data["hidden_states"], data["topk_ids"], data["topk_weights"]
+        st1 = _serving_stock(data, state).clone()
+        st2 = _serving_stock(data, state).clone()
         n1 = mk.forward(x, ids, w, 0, 32, lw, nw, POST_NORM_EPS, True).clone()
         n2 = mk.forward(x, ids, w, 0, 32, lw, nw, POST_NORM_EPS, True).clone()
-        o1 = old.forward(x, ids, w, 0, 32, lw0, nw, POST_NORM_EPS, True).clone()
-        o2 = old.forward(x, ids, w, 0, 32, lw0, nw, POST_NORM_EPS, True).clone()
         torch.cuda.synchronize()
-        nv = _cmp(n1, st1)
-        ov = _cmp(o1, st1)
-        ss = _cmp(st1, st2)
-        nn_ = _cmp(n1, n2)
-        oo = _cmp(o1, o2)
+        nv, ss, nn_ = _cmp(n1, st1), _cmp(st1, st2), _cmp(n1, n2)
         frac = float((n1.float() != st1.float()).float().mean())
-        print(f"MKNUM M={m} new_vs_stock rel={nv[1]:.2e} max={nv[2]:.1e} diff_frac={frac:.3f} | old_vs_stock rel={ov[1]:.2e} max={ov[2]:.1e} | stock_vs_stock eq={ss[0]} rel={ss[1]:.1e}"
-              f" | new_vs_new eq={nn_[0]} rel={nn_[1]:.1e} | old_vs_old eq={oo[0]} rel={oo[1]:.1e}", flush=True)
-'''.replace("__V0__", repr(MK_V0))
+        print(f"MKNUM M={m} new_vs_servingstock rel={nv[1]:.2e} max={nv[2]:.1e} diff_frac={frac:.3f} | stock_vs_stock eq={ss[0]} rel={ss[1]:.1e} | new_vs_new eq={nn_[0]} rel={nn_[1]:.1e}", flush=True)
+        if m in (8, 128):
+            _mk_stage_report(mk, lw, state, weights, data, m)
+'''
 
 
 def build(with_self):
