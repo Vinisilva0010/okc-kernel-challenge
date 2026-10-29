@@ -149,3 +149,12 @@ Ring floor now 3.18 TB/s (verify16); dq+mma add ~50 us on top (193 vs 143). veri
 Next (check 5, v7): groups with >16 tokens go to an NT2 or NT4 kernel with the shared A ring (regs permitting), groups <=16 stay on NT1; two launches into the same out (disjoint rows).
 Variants: A_G2P4 (control, all NT1), SPLIT2 (chunk 32), SPLIT4 (chunk 64). Expect verify32 1.9-2.2 if the hot expert dominated; verify16 slightly up (45-token expert).
 Decision: SPLIT gives >= +8% at verify32 and no loss elsewhere -> adopt; NT regs kill it again (<3%) -> stay NT1 and spend remaining checks on dq issue count.
+RESULT job bc266bce4355434c (official 5/5, v1 path). regs: mk7 NT1 123, NT2 176, NT4 248 (local 0).
+verify16: A_NT1 (mk7<2,4,1>) 2.20 (206us; mk6 read 2.35 in job 24627bd -> mk7's nm predicates cost regs 109->123), SPLIT2 1.96 (231us), SPLIT4 1.92. verify32: 1.58 / 1.52 / 1.51. Others identical (no group > 16).
+Reading: separate NT2/NT4 launch is SLOWER (regs 176/248 -> 2 CTAs/SM, and a serialized second launch). NT grouping is dead for good (checks 1 and 5). mk6 stays the base.
+Counter vs best (mk6 A_G2P4 2.35): check 5 flat -> 1 of 3.
+Next (check 6, v8): swap operands. Marlin's two n-blocks (2w, 2w+1) of a word are exactly an m16k16 A fragment {blo0, bhi0, blo1, bhi1} (rows g / g+8 = blocks 2w / 2w+1); tokens become the
+n8 B operand (b0 = ldmatrix reg 0/1, b1 = reg 2/3 of the existing x4 A load). Groups of <= 8 tokens need 4 mma per step instead of 8; 9..16 tokens 8 (unchanged). Output D[col][token]
+-> transposed atomics. Most experts have <= 8 tokens. Variants: control A_G2P4 (mk6), N8_G2P4, N8_G3P4 (mk8_k).
+Expect: NOMMA delta was ~36us/226 at verify16; halving mma for ~3/4 of groups -> +4..8%. Error stays 2e-3 (same products, same fp32 accumulate order).
+Decision: >= +5% at verify16 -> adopt; correctness off (err>1e-2) -> debug fragment mapping by reading the epilogue; flat -> counter 2 of 3.
