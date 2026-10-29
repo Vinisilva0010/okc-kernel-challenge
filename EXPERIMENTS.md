@@ -74,3 +74,20 @@ Lessons:
 - Direct shared-memory loads of 8-bit tiles into mma_v2 operand layouts are very slow in Gluon; a blocked load + convert_layout is better but still pays an extra smem round trip per tile.
 - One warp per program cannot hide the per-tile work (4 tile conversions + 2 MMAs + softmax) at ~6 programs/SM. A faster decode would need the tiles converted once into a fp16 staging buffer (producer stage). Estimated ceiling ~15-20% on decode16/32 only; deferred in favor of the MoE verify16/32 path (1.8x / 2.5x measured headroom).
 - Command hygiene: chain the patch and the check with && so a failed anchor stops the run.
+
+## MoE large M: prior art from infraax (read 2026-10-28 night, no runs spent)
+
+v1 profile (job ca73777bbf8e4953): verify32 GEMM1 263 us (1.65 TB/s on 23 experts), GEMM2 190 us (1.14 TB/s); verify16 202 / 144 us;
+decode32 147 / 113 us. v1 = infraax sonnet_v5: mma.sync consumers, register-prefetched weights, 32-token chunks, 3 CTAs/SM.
+
+infraax findings (design/breakdown c30b, c30d, c31; sonnet_v6, sonnet_v7):
+- WSTREAM (pure weight stream, same bytes and addresses, 16 independent 16-B loads per lane): 4.0 TB/s -> layout and DRAM locality are not the cap.
+- v5 is latency-bound: ~4.6 KB in flight per warp, ~1.45 us loaded round trip, ~1/3 of each item spent outside the stream (staging, fixup, epilogue).
+- v6 (deeper register / per-warp cp.async ring): no win (limit moved to the issue chain).
+- v7 (warp-specialised, 1 bulk-copy producer + 12 mma.sync consumers, mbarrier ring, 1 CTA/SM): slower than v5 in all three builds.
+  C31 bisect: the ring alone (bulk copy -> mbarrier -> lds -> release, no unpack, no mma) costs 214 us at bs256 ~= v5. wgmma would save only 7 %.
+  Their rule: do not re-propose a ring without a ring-only reading >= 3.3 TB/s.
+
+Our evidence they did not have: the Gluon cp.async ring (no mbarrier, 3 CTAs/SM, cooperative copy + wait_group) streams 3.88 TB/s on random
+128-B rows and 4.2 sequential (checks 54bc1970, measure_moebw_v1). Untested path: that ring + dequant once per weight tile into smem + wgmma over
+64-201 tokens. Gate before any integration: a single-expert microbenchmark; kill the MoE large-M work if it stays below 2.6 TB/s.
