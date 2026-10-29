@@ -118,3 +118,17 @@ Reading: (1) NT2/NT4 do NOT help: regs 136/208 cut occupancy; verify32 +4% only 
 (2) ring-only (copies+lds+fold+atomic epilogue) already costs 159 us at verify16 = 2.86 TB/s: the ring floor is below the 4 TB/s stream. Dequant costs ~50 us, mma ~36 us, additive (poor overlap).
 (3) verify32 ring-only 217us vs verify16 159us on similar bytes: the hot expert's 13 groups each re-copy its weights (L2 traffic), not only dequant.
 Decision for check 2 (v4): attack overlap + floor: P steps per wait/commit group (G4P2, G3P2, G3P4), KS x2/x4 (wave quantization: ~29 groups*128*KS2 = 7.4K items / 2.1K resident warps = 3.5 waves), NOEPI twin (atomic epilogue cost).
+
+## measure_mk_v4 (check 2): overlap (P steps per wait/commit), KS multiplier (wave quantization), atomic-epilogue twin
+Question: does batching P k-steps per wait/commit (all lds up front, dq of step 2 can overlap mma of step 1) lift RING4 verify16 (2.00 TB/s)?
+Is wave quantization (3.5 waves at KS2) or the atomic epilogue a visible cost (KS2x/4x, NOEPI twin = full compute + one folded plain store)?
+Variants: RING4, R4_KS2x, R4_KS4x, G4P2 (6 steps in flight), G3P2 (4), G3P4 (8), NOEPI. Expected: G*P >= +5% if the lds->dq latency chain is the issue (2.1-2.3);
+KS2x +/-5%; NOEPI -5..-15 us vs RING4 (verify16 226 us).
+Decisions: any variant >= +5% at verify16 -> adopt and stack; NOEPI gain > 10% -> epilogue redesign (plain stores when KS=1, or smem reduce); all flat -> third flat check would
+approach the kill line: the remaining lever is dequant instruction count (idea 4: 128 columns/warp) .
+RESULT job 60d631ee23b34c35 (official 5/5, 1.483x v1 path). regs: RING4 103, G4P2 111, G3P2 111, G3P4 121, NOEPI 99 (all local 0).
+verify16 TB/s: RING4 1.88 (241us; note the same kernel read 2.00 in job 92d20bf: run-to-run noise ~6%), KS2x 1.87, KS4x 1.83, G4P2 2.05, G3P2 2.07, G3P4 2.12 (214us), NOEPI 1.90.
+verify32: RING4 1.34, G4P2 1.46, G3P2 1.47, G3P4 1.51.  decode32: RING4 2.17, G3P4 2.44.  verify1: 1.78 -> 1.88.  decode1 1.61 -> 1.7.
+Reading: batching P steps per wait/commit: +13% at verify16 vs same-run RING4 (+6% vs the earlier 2.00), +13% verify32, +12% decode32; larger P better. Epilogue (atomics) costs ~0
+(NOEPI == RING4) and KS multiplier is flat -> wave quantization/epilogue are not limiters. Idea 5 (plain stores) dropped.
+Next (check 3, v5): sweep P further (G2P4, G4P4, G2P8, G3P8) and G3P4 with __launch_bounds__(128,5), control RING4 in-run. Expect G3P8/G2P8 2.2-2.3 if lds->dq latency is the issue; flat -> issue-bound.
