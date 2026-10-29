@@ -158,3 +158,10 @@ n8 B operand (b0 = ldmatrix reg 0/1, b1 = reg 2/3 of the existing x4 A load). Gr
 -> transposed atomics. Most experts have <= 8 tokens. Variants: control A_G2P4 (mk6), N8_G2P4, N8_G3P4 (mk8_k).
 Expect: NOMMA delta was ~36us/226 at verify16; halving mma for ~3/4 of groups -> +4..8%. Error stays 2e-3 (same products, same fp32 accumulate order).
 Decision: >= +5% at verify16 -> adopt; correctness off (err>1e-2) -> debug fragment mapping by reading the epilogue; flat -> counter 2 of 3.
+RESULT job dce14ea8a1574ec5 (official 5/5, v1 path). regs: A_G2P4 109, N8_G2P4 142, N8_G3P4 144 (local 0).
+verify16: A_G2P4 2.33 (194us), N8_G2P4 2.11 (215us), N8_G3P4 2.04. verify32: 1.68 / 1.50 / 1.45. decode32 2.66 / 2.44 / 2.40. verify1 1.96 / 1.81 / 1.89. err 2e-3 for N8 (fragment mapping CORRECT).
+Reading: swapped operands are correct but 9% SLOWER (regs +33, 4 atomics per acc with row stride). Flat/negative check -> counter 2 of 3 vs best (A_G2P4 ~2.33-2.35).
+Check 7 (v9) is the last bundle on this line before the kill rule applies (needs >= 5% over A_G2P4 at verify16): levers that attack the ring floor (3.18 TB/s vs 4.0 stream):
+  PF256: cp.async.cg ... .L2::256B on the weight copies (DRAM/L2 sector efficiency, hint only);  MB5: __launch_bounds__(128,5) on A_G2P4 (5 CTAs/SM);
+  W8_P4 / W8_P8: 8 warps per CTA share one A ring (A traffic per warp-step 128 -> 64 B; A copied by the first P warps; one __syncthreads per P steps).
+Control: A_G2P4 in the same run. If none >= +5%: Task 1 killed -> MOE_ANALYSIS.md (Task 3). If any >= +5%: continue stacking.
