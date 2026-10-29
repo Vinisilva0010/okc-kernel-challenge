@@ -61,3 +61,16 @@ Lessons:
 - The judge's speed-of-light column under-counts the active experts. With the real routing, v1 already streams ~2.2-3.1 TB/s in decode16/32
   (ceiling ~4.2): there was no 2x there. The MoE headroom is in verify16/32 (hot experts with 45-201 tokens: compute reuse) and decode1 (fixed cost).
 - Measure the real input distribution before estimating a gain.
+
+## Attention decode-full (decode16 / decode32), 2026-10-28 night
+
+| file | job | finding |
+|---|---|---|
+| measure_dec_v1 | 327804f0c752413d | (patch did not apply: anchor matched twice; ran infraax's original sweep) no decode config beats C64S3W2 (105 / 192 us) |
+| measure_dec_v1 | a7ea45428c234d9d | load-only twin is invalid: without a dot consuming the tiles Triton drops cp.async (cp.async=0) and runs 132 us |
+| measure_dec_v2 | 0362b4f2f51f49f8 | D1 (Gluon, 1 warp/program, cp.async ring, mma_v2): correct (2e-4) but slower: best 129.9 us (KL1) vs 105.6; direct smem->dot-operand loads of uint8 (KL0) 179-186 us |
+
+Lessons:
+- Direct shared-memory loads of 8-bit tiles into mma_v2 operand layouts are very slow in Gluon; a blocked load + convert_layout is better but still pays an extra smem round trip per tile.
+- One warp per program cannot hide the per-tile work (4 tile conversions + 2 MMAs + softmax) at ~6 programs/SM. A faster decode would need the tiles converted once into a fp16 staging buffer (producer stage). Estimated ceiling ~15-20% on decode16/32 only; deferred in favor of the MoE verify16/32 path (1.8x / 2.5x measured headroom).
+- Command hygiene: chain the patch and the check with && so a failed anchor stops the run.
