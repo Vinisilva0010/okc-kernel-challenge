@@ -261,3 +261,7 @@ new_vs_servingstock rel 5.65e-3..5.79e-3 (63-70% elements differ) - unchanged. S
 res = __hmul2(res, global_scale) [bf16 multiply, second rounding]. Stock output = bf16(bf16(acc_raw) * gs_bf16). We applied gs in fp32 inside the GEMM and rounded once.
 Fix (candidate v2, NOT yet checked - plan budget of 3 checks is spent): GEMM stores raw acc (no gs); consumers do rb(rb(sum) * gs[expert of row]) (act for GEMM1, reduce for GEMM2); needs exp_of_row from the route kernel.
 Expect: GEMM1 bf16 output equal to stock for ~all elements (differences only from fp32 summation order, rare 1-ulp flips), final output rel vs stock ~1e-4 or less, speed unchanged. First thing to run next time.
+
+## v2 check (last muse_moe_w4a16 check of Oct 29): measure_mk5_num.py = sub_mk5 (mk_moe_v2.py: stock Marlin write-out bf16(bf16(acc)*gs_bf16)) + CHECK-only MKNUM study
+Question: does reproducing Marlin's write-out rounding bring our output to stock's? Expect: GEMM1 bf16 equal to stock for nearly all elements (rare 1-ulp flips from fp32 summation order), final output rel L2 vs stock ~1e-4 or lower,
+OURS vs OURS bitwise, 5/5 tests, speed within ~2% of v1 (1.379x). Decision: holds -> v2 replaces v1 in mk_moe.py, generators rerun, patch regenerated + rule check; otherwise v1 stays and the numbers are written down.
