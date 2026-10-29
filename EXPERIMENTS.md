@@ -198,3 +198,9 @@ Reading: KS fix + fused epilogue = +3% overall (verify1 +11%, decode1 +6%). Glue
 Check 4 plan (sub_mk3 base + study measure_mkp_v2.py): GEMM2 has 64 n-tiles per group vs GEMM1's 128, so its best KS may be larger; ring depth G3P4 (more bytes in flight) was never tried inside the full pipeline.
 Sweep per shape: KS1 in {2,4,8,16} x KS2 in {2,4,8,16} x ring {G2, G3} (same ring for both GEMMs), graph-timed. Expect: KS2 = 2 x KS1 wins by 2-5% on some shapes; G3 +-2%.
 Decision: adopt a per-M table (KS1, KS2, ring) if it beats the current table by >= 3% on any shape without losing > 1% elsewhere (then final official check = check 5).
+RESULT check 4, job dc806c9b2b9643eb (measure_mkp_v2 = sub_mk2 + KS1 x KS2 x ring sweep, graph-timed, study routings; official 5/5, ~sub_mk2 numbers). Best vs current table (us):
+decode1 8/16/G2 55.1 vs 16/16 56.8 (-3%); decode16 4/8/G2 139.0 vs 8/8 140.8 (-1.3%); decode32 4/8 238.5 vs 4/4 239.7 (-0.5%); verify1 8/8 76.7 (= current); verify16 2/2 310.0 (= current);
+verify32 2/4 412.5 vs 2/2 417.2 (-1.1%). Ring G3 never wins (best G3 entries are 0.5-3% behind their G2 twins). max |diff| between configs 2e-4..4e-4.
+Reading: the table is at its optimum (<= 3%, within run noise ~1-2%); GEMM2 does not want a different KS from GEMM1; deeper ring does not help.
+STOP: check 3 was the last one that moved a case by >= 3%; check 4 found nothing to adopt. Budget: 4 of the 8 allowed checks used (6 of 20 left today). Final candidate = sub_mk2.py (job 5ea1d8aa3b604660).
+sub_mk3.py (ring/KS-per-GEMM plumbing, never run as an official check) removed to avoid confusion; measure_mkp_v2.py keeps the study.
