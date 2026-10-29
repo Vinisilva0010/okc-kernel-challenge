@@ -295,3 +295,15 @@ RESULT layer check 2, job 00913137abbe4a30 (sub_v5.py, moe5 active in all 9 buck
 decode32 214.9/393.7 -> 217.7/401.4; verify1 158.7/171.6 -> 162.3/168.9; verify16 397.0/501.0 -> 395.5/503.5; verify32 554.4/793.5 -> 544.0/769.0. Fixed-baseline score 1.4750 (v4) vs 1.4717 (v5): no measurable gain from moe5 in the layer (flat within noise, small-T slightly worse, verify32 -2..-3%).
 Decision: moe5 port does NOT win in the layer; best layer file stays sub_v4.py (1.4415 own-baseline / ~1.455 drift-corrected; below the +1% bar of 1.4525 by the job's number, no READY_TO_SUBMIT). sub_v5 kept only as a record (S12_MOE5 can be False).
 Layer checks left today: 18. MoE v3 checks (21:00) not started.
+
+## decode_layer plan STOPPED (Oct 29, priority change to public refs)
+State: board sub_v3.py 1.438x. Best candidate sub_v4.py (job cf810019b3fe4889: own-baseline 1.4415, drift-corrected ~1.455, below +1% bar 1.4525, no READY_TO_SUBMIT). sub_v5 (moe5 port, job 00913137abbe4a30) flat, 1.435. Layer checks left: 18. MoE v3 checks (21:00 Brasilia) not started. New task: PUBLIC_REFS.md / ref_ checks of vjeux + Madhavan files.
+
+## PUBLIC REFS (Oct 29 evening): check the public files as is
+Question: what do vjeux/okc-2026 (attention 2.610x, bf16_proj 1.501x) and Madhavan113/kerneloptimizer (decode_layer 2.139x) score per case on the judge, vs our board (1.892 / 1.171 / 1.438)?
+Expect: within +-3% of their public scores, 13/13-style tests pass. Decision: pass -> record per-case table in PUBLIC_REFS.md, build candidate = public file + our paths where faster per case; test failure or score far below public -> record and try the other repo's file. MoE: no checks until 21:00 Brasilia.
+RESULT public refs (judge, check, off board): attention ref_vjeux_attn.py job f867482c37984518 16/16 pass 2.683x (CI 2.642-2.740; board sub_v10 1.892x); bf16_proj ref_vjeux_proj.py job 4fe090fa5fda4cd9 9/9 pass 1.498x (board sub_v1 1.171x); decode_layer ref_madhavan_layer.py job 9f1575bda4a6430a 13/13 pass 2.127x (board sub_v3 1.438x). Tables in PUBLIC_REFS.md.
+Per-case absolute time, ours vs public: attention and decode_layer ours slower in ALL 12 cases (ours/ref 1.14-1.79); bf16_proj ours slower in 28/30 cases, ahead only on o at verify16/verify32 (0.99, 0.97 = noise; those cells are plain cuBLAS = SGLang baseline). So no per-case dispatch pays: candidates = public file + attribution header only.
+Candidate checks (question: does the header-only file reproduce the public score and pass tests? expect same +-2%; decision: ok -> READY_TO_SUBMIT.md, fail -> investigate).
+RESULT candidate checks (sub_pub1.py = public code + header, same code as ref_*): attention job 00884744e0ab4bbe 16/16 2.602x (ref 2.683x); bf16_proj job 65a6e80c32b04437 9/9 1.499x (ref 1.498x); decode_layer job 8e11ba740b75421d 13/13 2.153x (ref 2.127x). Same-code noise 0-3%.
+Decision: all three beat our board by +0.33..+0.72x; READY_TO_SUBMIT.md + PUBLIC_REFS.md written, nothing submitted. MoE: ref_madhavan_moe.py + sub_pub1.py staged, checks start 21:00 Brasilia. Checks left: attention 15, proj 18, layer 16, moe 0.
