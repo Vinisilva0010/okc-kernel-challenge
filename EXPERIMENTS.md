@@ -165,3 +165,8 @@ Check 7 (v9) is the last bundle on this line before the kill rule applies (needs
   PF256: cp.async.cg ... .L2::256B on the weight copies (DRAM/L2 sector efficiency, hint only);  MB5: __launch_bounds__(128,5) on A_G2P4 (5 CTAs/SM);
   W8_P4 / W8_P8: 8 warps per CTA share one A ring (A traffic per warp-step 128 -> 64 B; A copied by the first P warps; one __syncthreads per P steps).
 Control: A_G2P4 in the same run. If none >= +5%: Task 1 killed -> MOE_ANALYSIS.md (Task 3). If any >= +5%: continue stacking.
+RESULT job f6ffa925f34a4c82 (official 5/5, v1 path). regs: A_G2P4 109, PF256 109, MB5 90, W8_P4 111, W8_P8 128 (local 0).
+verify16 TB/s: A_G2P4 2.34 (193us), PF256 2.34, MB5 2.25, W8_P4 2.28, W8_P8 2.23.  verify32: 1.69 / 1.69 / 1.62 / 1.56 / 1.52.  decode32: 2.68 / 2.67 / 2.58 / 2.52 / 2.45.  err 2e-3.
+Reading: nothing beats the control. L2 prefetch hint = no effect; fewer regs (90) worse; 8 warps per CTA worse (CTA-wide barrier over more warps, 111-128 regs).
+KILL LINE: checks 5, 6, 7 gained < 5% (all <= 0%) on verify16 vs the best A_G2P4. Task 1 stopped. Task 2 gate (>= 2.4 TB/s on verify16) NOT reached (best 2.34-2.35). -> Task 3: MOE_ANALYSIS.md.
+Checks spent: 7 of 15 (10 of 20 left on muse_moe_w4a16 today).
