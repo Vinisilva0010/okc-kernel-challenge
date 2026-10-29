@@ -780,6 +780,7 @@ class MkLayer:
         assert w13.shape[1] * 16 == MK_HIDDEN and w13.shape[2] == 2 * 2 * MK_INTER, tuple(w13.shape)
         assert w2.shape[1] * 16 == MK_INTER and w2.shape[2] == 2 * MK_HIDDEN, tuple(w2.shape)
         assert w13.shape[0] == MK_EXPERTS and w2.shape[0] == MK_EXPERTS
+        assert w13_s.element_size() == 1 and w2_s.element_size() == 1
         self.w13 = w13
         self.w13_s = w13_s.view(torch.uint8)
         self.w2 = w2
@@ -839,6 +840,17 @@ class MkMoE:
         out = torch.empty((m, MK_HIDDEN), dtype=torch.bfloat16, device=x.device)
         e.mkp_epi(b["out2"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0)
         return out
+
+
+_MK_SHARED = {}
+
+
+def mk_shared(device):
+    """One MkMoE (compiled module and buffers) per device, shared by all layers: layers run one after the other on a stream."""
+    key = (device.type, device.index)
+    if key not in _MK_SHARED:
+        _MK_SHARED[key] = MkMoE().build(device).alloc(MK_MAX_TOKENS, MK_TOP_K, MK_HIDDEN, MK_INTER, device)
+    return _MK_SHARED[key]
 
 
 # ---- CHECK-only self-check (never part of a submitted file): offset 0 vs offset 96 relabelling, and the epilogue's two norm forms in torch.
