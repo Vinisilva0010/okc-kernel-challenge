@@ -99,3 +99,22 @@ Our evidence they did not have: the Gluon cp.async ring (no mbarrier, 3 CTAs/SM,
 | diag_marlin_v1 | a2e50f7340eb4e10 | tuned Marlin (infraax CONFIG_TABLE) vs stock: decode1 1.60, verify1 1.30, decode16 1.22, decode32 1.02, verify16 1.01, verify32 1.01 |
 | measure_mk_v1 | fc739e0c29aa4f63 | own GEMM reading SGLang's Marlin tensors directly: rel L2 2.0e-3 (layout decoded); register prefetch best 1.65 TB/s (verify16), deeper prefetch slower (regs 233-255, spills) |
 | measure_mk_v2 | 9eeae71bac414240 | per-warp cp.async ring, 80 regs: verify16 2.04 TB/s, decode32 2.37, verify32 1.47 (hot expert re-dequantized 13x); skip-flop dequant exact (2e-3) and faster than the 2^126 multiply; ring depth 4 = 8 -> instruction-bound now |
+
+## measure_mk_v3 (2026-10-29 night, check 1 of <=15): limiter twins + token groups NT 2/4 + occupancy
+Question: what limits RING4 at verify16 (dequant, mma, or the ring itself), and does grouping 32/64 tokens per item (dequant once per word
+for NT m-tiles) lift verify32 (1.47) without hurting the others?
+Variants (all GEMM1, same real distributions, same kernel template mk3_k<S,NT,MODE,MB>): RING4, RING8, NOMMA (dq kept, mma -> XOR fold into stored acc),
+NODQ (raw words to mma), RINGONLY (copies + lds/ldmatrix + XOR fold), RING4_NT2, RING4_NT4, RING4_MB8 (launch bounds 8 CTAs/SM).
+Expected: RING4 ~ v2 (verify16 2.04, verify32 1.46). NOMMA ~ RING4 (mma is cheap) ; NODQ and RINGONLY clearly faster. NT2/NT4: verify32 1.8-2.2 if
+regs stay < 128 w/o spills, others about equal.
+Decisions: RINGONLY << 2.6 -> ring/lds cost is the limiter -> idea 4 (128 cols/warp, shared A). NODQ ~ RING4 but NOMMA >> -> mma/accumulate is the limiter.
+RINGONLY ~ RING4 -> memory side/latency, not instructions: go for occupancy/deeper config. NT2/NT4 >= +15% at verify32 -> adopt NT by group size.
+RESULT job 92d20bf704e6423a (official 5/5 pass, v1 path 1.478x; MK numbers TB/s on weight bytes, GEMM1):
+regs/local: RING4 110/0, RING8 112/0, NOMMA 88, NODQ 87, RINGONLY 64, NT2 136, NT4 208, MB8 64/16 (spills).
+verify16 (us): RING4 226 (2.00) RING8 225 (2.01) NOMMA 190 (2.38) NODQ 176 (2.57) RINGONLY 159 (2.86) NT2 246 (1.84) NT4 334 MB8 251 (1.80)
+verify32 (us): RING4 304 (1.43) NOMMA 256 NODQ 235 RINGONLY 217 (2.00) NT2 291 (1.49) NT4 378 (1.15) MB8 333
+decode32: RING4 2.31, RINGONLY 3.51, NT2 2.01.   err 2e-3 for all real variants (verify16/32, decode1).
+Reading: (1) NT2/NT4 do NOT help: regs 136/208 cut occupancy; verify32 +4% only for NT2, verify16 -8%. Idea 1 as written is dead (hot expert would need dequant->smem staging).
+(2) ring-only (copies+lds+fold+atomic epilogue) already costs 159 us at verify16 = 2.86 TB/s: the ring floor is below the 4 TB/s stream. Dequant costs ~50 us, mma ~36 us, additive (poor overlap).
+(3) verify32 ring-only 217us vs verify16 159us on similar bytes: the hot expert's 13 groups each re-copy its weights (L2 traffic), not only dequant.
+Decision for check 2 (v4): attack overlap + floor: P steps per wait/commit group (G4P2, G3P2, G3P4), KS x2/x4 (wave quantization: ~29 groups*128*KS2 = 7.4K items / 2.1K resident warps = 3.5 waves), NOEPI twin (atomic epilogue cost).
