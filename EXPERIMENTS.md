@@ -170,3 +170,24 @@ verify16 TB/s: A_G2P4 2.34 (193us), PF256 2.34, MB5 2.25, W8_P4 2.28, W8_P8 2.23
 Reading: nothing beats the control. L2 prefetch hint = no effect; fewer regs (90) worse; 8 warps per CTA worse (CTA-wide barrier over more warps, 111-128 regs).
 KILL LINE: checks 5, 6, 7 gained < 5% (all <= 0%) on verify16 vs the best A_G2P4. Task 1 stopped. Task 2 gate (>= 2.4 TB/s on verify16) NOT reached (best 2.34-2.35). -> Task 3: MOE_ANALYSIS.md.
 Checks spent: 7 of 15 (10 of 20 left on muse_moe_w4a16 today).
+
+## DAY PLAN (Oct 29 day): sub_mk1.py = full MoE on SGLang's Marlin tensors (mk6_k<2,4> for GEMM1 and GEMM2)
+Check 1 (sub_mk1.py): Question: do all 5 tests pass with a complete graph-safe MK path (route kernel -> gather+zero -> GEMM1 -> SiLU*up -> GEMM2 -> scatter -> v1 epilogue),
+and where does each case stand vs SGLang? Expect: tests pass (rel L2 ~2e-3 + bf16 roundings < 1.5%); speedups vs SGLang roughly verify16/32 1.2-1.5x, decode16/32 1.0-1.3x, decode1/verify1 1.2-1.5x
+(GEMM1 ~= v1's speed per MK study; GEMM2 and glue unmeasured). Decisions: test failure -> fix that part only; passes -> profile the largest stage (profiles/*.txt) and attack it next.
+RESULT check 1, job a0b20c3c199d4c67: sub_mk1.py 5/5 tests pass, mkp active, overall 1.336x (v1 1.480x). Per case vs SGLang: decode1 1.568, decode16 1.262, decode32 1.085, verify1 1.202,
+verify16 1.478 (317.2 us vs 468.9), verify32 1.491 (408.5 vs 608.8). Targets (verify16/32 >= 1.4x) MET; decode16/32 >= 1.2x: decode16 met, decode32 NOT; decode1/verify1 >= 1.3x: decode1 met, verify1 NOT.
+Profile (GPU us): mkg_k (GEMM1+GEMM2) 39.8 / 164.1 / 164.9 / 102.9 / 275.8 / 394.2 for decode1/decode16/decode32/verify1/verify16/verify32 (73-94% of the call);
+glue per call: gather 2.7-6.9, act 2.8-5.9, scatter 1.3-3.7, route 1.7-2.8, epilogue 3.6-6.0 (decode1: glue+epilogue = 14.6 of 54.5 us).
+Reading: GEMMs dominate. KS table (8:16, 16:8, 32:4, else 2) was a guess; verify1 (103 us for ~6 experts) looks far from the stream rate.
+Check 2 plan: measure_mkp_v1.py = sub_mk1 + a prepare() study (CHECK only): time the whole _kernel_mkp inside a CUDA graph (also proves graph safety) on routing built from the real
+tokens-per-expert distributions of CLAUDE.md, for KS in {1,2,4,8,16} per shape. Question: which KS per M is best? Expect verify1/decode1 to prefer a different KS than 16 (perhaps 8), decode32 KS 4-8.
+Decision: adopt the best KS per M bucket in sub_mk2.py (shape-only table) if it gains >= 3% on any case; otherwise attack glue fusion.
+RESULT check 2, job 788e51010c7f4913 (measure_mkp_v1; official 5/5 pass; judge numbers ~= sub_mk1). Whole _kernel_mkp captured in a CUDA graph for all 6 shapes x 5 KS: OK (graph safe confirmed).
+Study routing = CLAUDE.md distributions (absolute us are higher than the judge's own routings; compare KS within a row). us:
+decode1:  KS1 104.4 KS2 85.8 KS4 72.1 KS8 60.0 KS16 59.1    decode16: 191.0 / 162.0 / 142.8 / 142.8 / 154.7    decode32: 292.6 / 250.5 / 239.2 / 240.4 / 263.2
+verify1:  KS1 119.3 KS2 105.2 KS4 86.5 KS8 77.5 KS16 87.7   verify16: 326.5 / 311.9 / 314.4 / 331.9 / 410.0   verify32: 437.5 / 419.9 / 423.2 / 468.2 / 593.6
+(output vs KS1: 4e-4..6e-4, i.e. only split-K atomic order). Reading: current table (M<=8: 16, <=16: 8, <=32: 4, else 2) is right except M=8 (verify1): KS8 is 12% faster than KS16.
+Check 3 plan (sub_mk2.py): (1) KS table M<=1:16, M<=8:8; (2) fused CUDA scatter+epilogue kernel: block per token, reads fp32 GEMM2 rows via row_of_slot (written by the route kernel),
+two passes (sumsq of y*w per slot, then sum of y*coef, times w), one bf16 rounding at the store; removes mkp_scatter (1.3-3.7 us), the bf16 round-trip of y and the Triton/SGLang epilogue (3.6-6.0 us).
+Expect: verify1 +6-8% (GEMM 103 -> ~92 us), decode1 -4 us (52 -> ~48), others -3..-6 us (1-2%). Decision: tests pass and no case regresses -> keep; if the new epilogue fails a test -> fix numerics only.
