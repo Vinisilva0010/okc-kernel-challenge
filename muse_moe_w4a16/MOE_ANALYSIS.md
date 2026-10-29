@@ -51,5 +51,5 @@ Targets were 2.6 (verify16) and 2.2 (verify32): NOT reached. For reference v1's 
    saving needs a different trick (a packed prmt LUT was estimated at 9 ops per 4 values vs ~6 now, so no).
 3. A split-by-expert-size launch with persistent CTAs (hot expert on its own big-tile kernel, small experts on the ring kernel) running concurrently on one stream via two CTA classes
    in one grid (my two-launch version serialized and lost).
-4. Because the official benchmark sums GEMM1 + GEMM2 + routing + epilogue, even a 2.6 TB/s GEMM1 would shift verify16/verify32 by about 10% of the MoE time; the current board file (1.480x)
-   needs >= 1% gain to matter and A_G2P4 as measured does not clear that bar on its own, which is why Task 2 (sub_v6.py) was not started.
+4. Integration value is unmeasured: GEMM1 is only part of the MoE call (GEMM2, routing, epilogue are separate). v1's profile gives GEMM2 144 us at verify16 and 190 us at verify32,
+   so a GEMM1 gain alone is diluted; whether A_G2P4 clears the +1% bar over the 1.480x board file was not tested (Task 2 gate not met, sub_v6.py not started).
