@@ -191,3 +191,10 @@ verify1:  KS1 119.3 KS2 105.2 KS4 86.5 KS8 77.5 KS16 87.7   verify16: 326.5 / 31
 Check 3 plan (sub_mk2.py): (1) KS table M<=1:16, M<=8:8; (2) fused CUDA scatter+epilogue kernel: block per token, reads fp32 GEMM2 rows via row_of_slot (written by the route kernel),
 two passes (sumsq of y*w per slot, then sum of y*coef, times w), one bf16 rounding at the store; removes mkp_scatter (1.3-3.7 us), the bf16 round-trip of y and the Triton/SGLang epilogue (3.6-6.0 us).
 Expect: verify1 +6-8% (GEMM 103 -> ~92 us), decode1 -4 us (52 -> ~48), others -3..-6 us (1-2%). Decision: tests pass and no case regresses -> keep; if the new epilogue fails a test -> fix numerics only.
+RESULT check 3, job 5ea1d8aa3b604660: sub_mk2.py 5/5 pass, overall 1.377x (sub_mk1 1.336x). decode1 1.663 (47.5 us), decode16 1.287, decode32 1.083, verify1 1.334 (107.3), verify16 1.482 (320.9), verify32 1.484 (417.4).
+Kernel profile (GPU us, decode1/dec16/dec32/ver1/ver16/ver32): mkg_k 29.1/124.6/233.2/123.9/290.9/457.8 (71-95%); mkp_epi 4.3/5.4/6.0/5.6/6.8/7.4; gather 2.8/3.1/3.2/2.8/5.0/8.7; act 2.8/3.7/4.0/3.8/4.9/6.6; route 1.8-3.1.
+(The profile pass uses its own routings: its decode32 GEMM sum is 233 us vs 165 us in check 1, so compare profiles only within one job.)
+Reading: KS fix + fused epilogue = +3% overall (verify1 +11%, decode1 +6%). Glue is now 3-25% (decode1 only); GEMMs 90%+ elsewhere. Rule "two checks in a row < 3%": not triggered (check 3 moved verify1 +11%).
+Check 4 plan (sub_mk3 base + study measure_mkp_v2.py): GEMM2 has 64 n-tiles per group vs GEMM1's 128, so its best KS may be larger; ring depth G3P4 (more bytes in flight) was never tried inside the full pipeline.
+Sweep per shape: KS1 in {2,4,8,16} x KS2 in {2,4,8,16} x ring {G2, G3} (same ring for both GEMMs), graph-timed. Expect: KS2 = 2 x KS1 wins by 2-5% on some shapes; G3 +-2%.
+Decision: adopt a per-M table (KS1, KS2, ring) if it beats the current table by >= 3% on any shape without losing > 1% elsewhere (then final official check = check 5).
