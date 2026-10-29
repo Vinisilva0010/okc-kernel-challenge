@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(okc check:*)",
+      "Bash(okc status:*)",
+      "Bash(okc jobs:*)",
+      "Bash(okc leaderboard:*)",
+      "Bash(okc problems:*)",
+      "Bash(okc show:*)",
+      "Bash(python3:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(grep:*)",
+      "Bash(sed:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(cp:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(date:*)",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep"
+    ],
+    "deny": [
+      "Bash(okc submit:*)",
+      "Bash(okc withdraw:*)",
+      "Bash(okc serve submit:*)",
+      "Bash(okc serve check:*)",
+      "Bash(okc logout:*)",
+      "Bash(okc login:*)",
+      "Bash(rm -rf:*)",
+      "Bash(sudo:*)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(apt:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git checkout -- :*)"
+    ]
+  }
+}
