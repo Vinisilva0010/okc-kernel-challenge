@@ -276,3 +276,7 @@ Derived from existing jobs only (details in MOE_V3_PLAN.md): GEMM1/GEMM2 split o
 at decode1 / verify1 / decode32 / verify16 / verify32 = 1.8 / ~2.7 / 2.6 / 2.3 / 1.6 TB/s. Cross-check verify32: 257 + 137 = 394 = mkg_k of job 3bf003f0 (394).
 Finding: GEMM2 is NOT near 1.1 TB/s (that was v1's own kernel); both GEMMs cost a constant per 16-token group-pass (GEMM1 6.6-7.0 us, GEMM2 3.5 us ~ 2.7 TB/s per pass), so the verify32 shortfall is the 39 passes for 23 experts
 (upper bound of removing duplicates: verify32 -38%, verify16 -13%). Plan ranks: (1) smem-staged dequant for experts with >= 2 groups, (2) per-GEMM KS, (3) glue fusion, (4) PDL.
+v3 implementation (14:00-17:00, nothing compiled or run: no nvcc/GPU here): mk_moe/mk_moe_v3.py = v2 + (a) hot-expert kernel mkh_k (producer warp dequantizes each Marlin tile once into a shared-memory fragment ring, 4 consumer warps = 4 token
+groups run v2's mma sequence; named barriers; 160 threads; route kernel emits hot chunks (up to 4 groups) for experts with >= 2 groups, plain groups otherwise; used only for M > 16), (b) per-GEMM KS table (default = v2's, same KS for both),
+(c) a stage-timer hook in forward. Generator tools/build_v3.py: sub_mk6.py (clean), measure_mk6_v3.py (study: bitwise v3==v2 and v3(hot off)==v2, v3 vs serving stock, graph latency v2/v3off/v3, per-stage event times, register/spill probe;
+disables the hot kernel for the official run if the bitwise check fails), measure_mk7_ks.py (graph-timed KS1 x KS2 sweep on v3). Checks start 21:00.
