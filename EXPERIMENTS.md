@@ -280,3 +280,12 @@ v3 implementation (14:00-17:00, nothing compiled or run: no nvcc/GPU here): mk_m
 groups run v2's mma sequence; named barriers; 160 threads; route kernel emits hot chunks (up to 4 groups) for experts with >= 2 groups, plain groups otherwise; used only for M > 16), (b) per-GEMM KS table (default = v2's, same KS for both),
 (c) a stage-timer hook in forward. Generator tools/build_v3.py: sub_mk6.py (clean), measure_mk6_v3.py (study: bitwise v3==v2 and v3(hot off)==v2, v3 vs serving stock, graph latency v2/v3off/v3, per-stage event times, register/spill probe;
 disables the hot kernel for the official run if the bitwise check fails), measure_mk7_ks.py (graph-timed KS1 x KS2 sweep on v3). Checks start 21:00.
+
+## muse_decode_layer (from 14:50; priority change: phase-1 rank). Board sub_v3.py 1.438x. Plan: DECODE_LAYER_PLAN.md
+Layer check 1 (sub_v4.py = sub_v3 with LARGEM_MIN_TOKENS 33 -> 32): Question: does the MoE-v4 large-M CUDA path beat Marlin(+S1 knobs) at T = 32 (decode 32, the weakest load: 1.287x; MoE 133 us sliding / 179 us full of 234 / 459)?
+Expect: MoE -8..-12% at T=32 (MoE problem: ~8-9% over Marlin at 32 tokens) => decode 32 sliding 235 -> ~222, full 413 -> ~395, load 1.287 -> ~1.35, overall 1.438 -> ~1.45. All other cases unchanged (within +-1.5%).
+Decision: decode 32 load >= +3% and 13/13 -> keep (then port moe5); not better than Marlin -> revert (the Marlin knobs stay) and go to the moe5 port / projections.
+RESULT layer check 1, job cf810019b3fe4889 (sub_v4.py): 13/13 pass, overall 1.4415 (CI 1.420-1.463; board job 1.4375). Ours (us), sub_v3 -> sub_v4: decode32 sliding 235.3 -> 214.9 (-8.7%), full 413.0 -> 393.7 (-4.7%); decode1 106.9/117.1 -> 107.2/115.0; decode16 186.8/276.9 -> 181.2/273.3;
+verify1 160.0/171.5 -> 158.7/171.6; verify16 403.0/515.0 -> 397.0/501.0; verify32 574.8/802.9 -> 554.4/793.5 (unchanged paths drift -0..-3.5% between jobs; the SGLang column of this job is also 2-5% lower: 256.3 vs 269.8 on decode32 sliding).
+Scores: own-SGLang 1.4415; with the board job's SGLang times held fixed 1.4750 (includes the drift); drift-corrected from decode32 only: load ratio 0.929 => x1.0762 => overall x1.0123 => ~1.455. Judge noise of the overall ratio is about +-1.5%.
+Decision: KEEP (real gain at T=32, 13/13). Not yet >= +1% by the job's own number (1.4415 < 1.4525): no READY_TO_SUBMIT yet. Next: moe5 port (v5 template) for the other MoE shapes, stacked on sub_v4.
