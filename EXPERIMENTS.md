@@ -270,3 +270,9 @@ MKNUM vs serving stock: M=1 5.3e-5, M=8 2.9e-4, M=16 1.0e-3, M=32 1.6e-4, M=128 
 STAGES (M=8, 128): GEMM1 bf16 vs stock rel 2.4e-5 / 2.8e-5 with 100% of elements equal; silu*up 6.4e-5 / 1.3e-4 (100% equal); GEMM2 bf16 3.0e-4 / 3.1e-4 (99% equal). (study's ours_fp32 truth column is meaningless in v2: raw sum has no global scale.)
 Decision: holds (parity 20-100x better, deterministic, 5/5); speed -0.9..-3.2% per case (-2.1% overall; judge noise ~2%) accepted. mk_moe_v2.py copied over mk_moe.py (v1 kept as mk_moe_v1.py), generators rerun,
 patch regenerated (649 added lines, 37,402 bytes), rules OK, py_compile OK, nested commit e8af105. daily budget: muse_moe_w4a16 0 of 20 checks left.
+
+## v3 planning (Oct 29 afternoon, no checks available until 21:00 Brasilia)
+Derived from existing jobs only (details in MOE_V3_PLAN.md): GEMM1/GEMM2 split of mkg_k at the MK-study routings: GEMM1 (job f6ffa925) + glue (job 5ea1d8aa profile) + graph pipeline (job 788e5101) -> GEMM2 = 15 / ~18 / 76 / 100 / 137 us
+at decode1 / verify1 / decode32 / verify16 / verify32 = 1.8 / ~2.7 / 2.6 / 2.3 / 1.6 TB/s. Cross-check verify32: 257 + 137 = 394 = mkg_k of job 3bf003f0 (394).
+Finding: GEMM2 is NOT near 1.1 TB/s (that was v1's own kernel); both GEMMs cost a constant per 16-token group-pass (GEMM1 6.6-7.0 us, GEMM2 3.5 us ~ 2.7 TB/s per pass), so the verify32 shortfall is the 39 passes for 23 experts
+(upper bound of removing duplicates: verify32 -38%, verify16 -13%). Plan ranks: (1) smem-staged dequant for experts with >= 2 groups, (2) per-GEMM KS, (3) glue fusion, (4) PDL.
