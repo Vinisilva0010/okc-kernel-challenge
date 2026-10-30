@@ -311,3 +311,8 @@ Decision: all three beat our board by +0.33..+0.72x; READY_TO_SUBMIT.md + PUBLIC
 ## MoE public ref (Oct 29 21:05 Brasilia, checks reset)
 Question: what does Madhavan's muse_moe_w4a16 (listed 2.357x) score per case on the judge vs our board sub_v1 1.480x? Expect 2.25-2.45x, tests pass. Decision: pass -> check header-only sub_pub1.py, then per-case compare with sub_v1 / MK v2 (dispatch only where ours is faster); fail -> try vjeux's moe file.
 RESULT MoE: ref_madhavan_moe.py job 9b10a32ed95b4477 5/5 2.311x; sub_pub1.py (header only) job d97cc04bbb7745ed 5/5 2.347x vs board 1.480x; ours slower in all 6 cases, no dispatch. READY_TO_SUBMIT.md complete for all four. MoE checks left 18.
+
+## PUBLIC REFS 2 (Oct 30 03:35 UTC): the four missing public files
+Question: per scored case, is the other public author's file faster than the one in sub_pub1 (attn: Madhavan vs vjeux; proj: Madhavan vs vjeux; layer: vjeux vs Madhavan; moe: vjeux vs Madhavan)? Needed to build sub_pub2 = per-case best.
+Expect: each within +-10% of the sub_pub1 overall; tests pass. Decision: if a file wins some cases by >3% (beyond the 2-3% judge noise) -> build a shape-only dispatch sub_pub2 (both credited); if it wins none -> no sub_pub2 for that problem, its sub_pub1 stays.
+Files: ref_madhavan_attn.py, ref_madhavan_proj.py, ref_vjeux_layer.py, ref_vjeux_moe.py (unchanged bytes of the public files).
