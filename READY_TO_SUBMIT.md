@@ -11,9 +11,8 @@ All numbers below are from the `okc check` logs listed (profiles/sub_pub1.<job>.
 | muse_attention_decode | muse_attention_decode/sub_pub1.py | 00884744e0ab4bbe | 16/16 | 2.602x | 1.892x (sub_v10) | +0.710x |
 | muse_bf16_proj | muse_bf16_proj/sub_pub1.py | 65a6e80c32b04437 | 9/9 | 1.499x | 1.171x (sub_v1) | +0.328x |
 | muse_decode_layer | muse_decode_layer/sub_pub1.py | 8e11ba740b75421d | 13/13 | 2.153x | 1.438x (sub_v3) | +0.715x |
-| muse_moe_w4a16 | muse_moe_w4a16/sub_pub1.py | NOT CHECKED (0 checks left until 21:00 Brasilia) | - | - | 1.480x (sub_v1) | pending |
+| muse_moe_w4a16 | muse_moe_w4a16/sub_pub1.py | d97cc04bbb7745ed | 5/5 | 2.347x | 1.480x (sub_v1) | +0.867x |
 
-MoE: not ready. Next steps at 21:00: check ref_madhavan_moe.py, then sub_pub1.py, then fill this file.
 
 ## muse_attention_decode: `muse_attention_decode/sub_pub1.py`
 Job 00884744e0ab4bbe, 16/16 tests, 2.602x (95% CI 2.563-2.660). Board file: sub_v10.py (job a095ad7c9ccb4136, 1.892x).
@@ -87,6 +86,18 @@ Job 8e11ba740b75421d, 13/13 tests, 2.153x (95% CI 2.120-2.185). Board file: sub_
 | verify 32 · sliding | 574.77 | 327.80 | 329.50 | 1.297 | 2.247 | 2.253 | 1.75 |
 | verify 32 · full | 802.93 | 491.50 | 492.70 | 1.375 | 2.210 | 2.215 | 1.63 |
 
+## muse_moe_w4a16: `muse_moe_w4a16/sub_pub1.py`
+Job d97cc04bbb7745ed, 5/5 tests, 2.347x (95% CI 2.311-2.382). Board file: sub_v1.py (job e65993b3c77c4052, 1.480x). Public ref (as is) job 9b10a32ed95b4477 2.311x.
+
+| case | board ours us | public ref us | candidate us | board speedup | ref speedup | cand speedup | ours/ref (time) |
+|---|---|---|---|---|---|---|---|
+| decode 1 | 42.54 | 25.30 | 25.20 | 1.809 | 3.049 | 3.057 | 1.68 |
+| decode 16 | 131.26 | 93.80 | 95.30 | 1.424 | 2.004 | 2.035 | 1.40 |
+| decode 32 | 186.50 | 128.20 | 126.10 | 1.093 | 1.606 | 1.631 | 1.45 |
+| verify 1 · 8 tokens | 97.34 | 66.90 | 63.20 | 1.480 | 2.195 | 2.248 | 1.46 |
+| verify 16 · 128 tokens | 294.78 | 186.00 | 183.30 | 1.564 | 2.534 | 2.576 | 1.58 |
+| verify 32 · 256 tokens | 386.23 | 221.50 | 217.90 | 1.613 | 2.793 | 2.843 | 1.74 |
+
 ## Rules checklist (CLAUDE.md hard rules). "scan" = grep of the file for .item/.cpu/.tolist/synchronize/print/caches, then reading the hits; it is not a full audit of 3-19k lines.
 | rule | attention | bf16_proj | decode_layer |
 |---|---|---|---|
@@ -98,3 +109,5 @@ Job 8e11ba740b75421d, 13/13 tests, 2.153x (95% CI 2.120-2.185). Board file: sub_
 | no submit/withdraw/serve run | yes | yes | yes |
 | shape dispatch only (no input-value dispatch) | `_TUNED` keyed by (B, L, window, pairs); plan from shapes. Also: single-request builds read `page_table.shape[1]` as a speculation of seq len, checked on device against seq_lens (shape-derived, verified) | choice keyed by (layer, m) | shape-keyed (scan) |
 Other notes for the human: (a) code identical to public entries rank ~93-141 now, so an identical-score entry will tie them; originality is by header only. (b) judge noise between same-code runs was 0-3% (PUBLIC_REFS.md).
+
+MoE rules (scan): kernel_fn does only dtype/contiguous conversions of inputs, a host pointer-alignment test (`data_ptr() & 15`, no tensor values), chunk launches and an output allocation; `synchronize`/prints are in prepare self-test/diag code that is off by default (DIAG=False, ROUTE_LOGITS_SELFTEST=False); weights are only bit/byte repacked (NVFP4 kept, scales and fp32 global scale untouched), activations bf16, 8 routed experts and post-expert RMSNorm kept per its docstring. Passed 5/5. Not an audit of all 6,372 lines. Memory: prepare keeps several repacked weight copies (see PUBLIC_REFS.md).

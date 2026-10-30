@@ -11,7 +11,7 @@ License files: ref-vjeux has a LICENSE (stock Apache-2.0 text, owner placeholder
 | muse_attention_decode | vjeux (2.610 listed) | f867482c37984518 | 16/16 | 2.683x | 00884744e0ab4bbe | 2.602x | 1.892x |
 | muse_bf16_proj | vjeux (1.501 listed) | 4fe090fa5fda4cd9 | 9/9 | 1.498x | 65a6e80c32b04437 | 1.499x | 1.171x |
 | muse_decode_layer | Madhavan (2.139 listed) | 9f1575bda4a6430a | 13/13 | 2.127x | 8e11ba740b75421d | 2.153x | 1.438x |
-| muse_moe_w4a16 | Madhavan (2.357 listed) | NOT RUN: 0 of 20 checks until 00:00 UTC (21:00 Brasilia) | - | - | - | - | 1.480x |
+| muse_moe_w4a16 | Madhavan (2.357 listed) | 9b10a32ed95b4477 | 5/5 | 2.311x | d97cc04bbb7745ed | 2.347x | 1.480x |
 
 Same code, two samples: attention 2.683 vs 2.602 (-3%), proj 1.498 vs 1.499, layer 2.127 vs 2.153: judge noise is about +-2-3% on these.
 Only the vjeux or Madhavan version of each problem was checked (the listed faster one). Madhavan's attention/proj are different code from vjeux's (4374 / 2468 differing lines) and were not checked.
@@ -99,10 +99,18 @@ Public file as is (`ref_*.py`): job 9f1575bda4a6430a, 13/13 tests, **2.127x** (C
 
 SGLang column differs per job (judge drift), compare the time columns with that in mind.
 
-## MoE (not yet checked)
-Our board: muse_moe_w4a16/sub_v1.py (infraax sonnet_v5) 1.480x. `ref_madhavan_moe.py` (unchanged copy) and `sub_pub1.py` (header added, py_compile ok) are staged. At 21:00 Brasilia:
-check `ref_madhavan_moe.py` first (per-case table here), then `sub_pub1.py`; our infraax path (and the MK v2/v3 path) only goes in per case if its time is lower in that case.
-Public MoE per-case numbers from the repos' own profiles are NOT used here (rule: every number from a judge log we ran).
+## MoE: Madhavan113/kerneloptimizer
+Public file as is (`ref_madhavan_moe.py`): job 9b10a32ed95b4477, 5/5 tests, **2.311x** (CI 2.277-2.346). Header-only candidate (`sub_pub1.py`): job d97cc04bbb7745ed, 5/5 tests, **2.347x** (CI 2.311-2.382). Our board file: sub_v1.py (job e65993b3c77c4052, 1.480x).
+Our board path is slower in all 6 cases (ours/ref 1.3-1.7 in time), so no dispatch to our code (MK v2/v3 not mixed in: they are slower than sub_v1's class of numbers at these shapes and unverified against these).
+
+| case | board ours us | public ref us | candidate us | board speedup | ref speedup | cand speedup | ours/ref (time) |
+|---|---|---|---|---|---|---|---|
+| decode 1 | 42.54 | 25.30 | 25.20 | 1.809 | 3.049 | 3.057 | 1.68 |
+| decode 16 | 131.26 | 93.80 | 95.30 | 1.424 | 2.004 | 2.035 | 1.40 |
+| decode 32 | 186.50 | 128.20 | 126.10 | 1.093 | 1.606 | 1.631 | 1.45 |
+| verify 1 · 8 tokens | 97.34 | 66.90 | 63.20 | 1.480 | 2.195 | 2.248 | 1.46 |
+| verify 16 · 128 tokens | 294.78 | 186.00 | 183.30 | 1.564 | 2.534 | 2.576 | 1.58 |
+| verify 32 · 256 tokens | 386.23 | 221.50 | 217.90 | 1.613 | 2.793 | 2.843 | 1.74 |
 
 ## Step 4: how the public kernels store weights / read KV, and could they run in SGLang?
 

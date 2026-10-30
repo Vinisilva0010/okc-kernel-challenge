@@ -307,3 +307,7 @@ Per-case absolute time, ours vs public: attention and decode_layer ours slower i
 Candidate checks (question: does the header-only file reproduce the public score and pass tests? expect same +-2%; decision: ok -> READY_TO_SUBMIT.md, fail -> investigate).
 RESULT candidate checks (sub_pub1.py = public code + header, same code as ref_*): attention job 00884744e0ab4bbe 16/16 2.602x (ref 2.683x); bf16_proj job 65a6e80c32b04437 9/9 1.499x (ref 1.498x); decode_layer job 8e11ba740b75421d 13/13 2.153x (ref 2.127x). Same-code noise 0-3%.
 Decision: all three beat our board by +0.33..+0.72x; READY_TO_SUBMIT.md + PUBLIC_REFS.md written, nothing submitted. MoE: ref_madhavan_moe.py + sub_pub1.py staged, checks start 21:00 Brasilia. Checks left: attention 15, proj 18, layer 16, moe 0.
+
+## MoE public ref (Oct 29 21:05 Brasilia, checks reset)
+Question: what does Madhavan's muse_moe_w4a16 (listed 2.357x) score per case on the judge vs our board sub_v1 1.480x? Expect 2.25-2.45x, tests pass. Decision: pass -> check header-only sub_pub1.py, then per-case compare with sub_v1 / MK v2 (dispatch only where ours is faster); fail -> try vjeux's moe file.
+RESULT MoE: ref_madhavan_moe.py job 9b10a32ed95b4477 5/5 2.311x; sub_pub1.py (header only) job d97cc04bbb7745ed 5/5 2.347x vs board 1.480x; ours slower in all 6 cases, no dispatch. READY_TO_SUBMIT.md complete for all four. MoE checks left 18.
