@@ -27,7 +27,13 @@
       "Edit",
       "Write",
       "Glob",
-      "Grep"
+      "Grep",
+      "Bash(/home/vnspo/.okc/bin/okc check:*)",
+      "Bash(/home/vnspo/.okc/bin/okc status:*)",
+      "Bash(/home/vnspo/.okc/bin/okc jobs:*)",
+      "Bash(/home/vnspo/.okc/bin/okc leaderboard:*)",
+      "Bash(/home/vnspo/.okc/bin/okc problems:*)",
+      "Bash(/home/vnspo/.okc/bin/okc show:*)"
     ],
     "deny": [
       "Bash(okc submit:*)",
@@ -44,7 +50,12 @@
       "Bash(git push --force:*)",
       "Bash(git push -f:*)",
       "Bash(git reset --hard:*)",
-      "Bash(git checkout -- :*)"
+      "Bash(git checkout -- :*)",
+      "Bash(/home/vnspo/.okc/bin/okc submit:*)",
+      "Bash(/home/vnspo/.okc/bin/okc withdraw:*)",
+      "Bash(/home/vnspo/.okc/bin/okc serve:*)",
+      "Bash(/home/vnspo/.okc/bin/okc logout:*)",
+      "Bash(/home/vnspo/.okc/bin/okc login:*)"
     ]
   }
 }
