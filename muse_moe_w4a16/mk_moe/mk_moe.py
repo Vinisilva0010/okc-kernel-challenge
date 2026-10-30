@@ -2,7 +2,8 @@
 
 Single source of truth: tools/build_sub_mk3.py pastes this file into the phase-1 check file and copies it unchanged to
 python/sglang/srt/layers/moe/muse_mk_moe.py. Weights are SGLang's Marlin tensors as they are (no second copy).
-Path: route (GPU) -> gather -> GEMM1 -> SiLU(gate) * up -> GEMM2 -> fused post-expert norm + weighted sum.
+v6: no gather kernel; GEMM1 reads the token rows of x directly through slot_of_row (bitwise equal to v2).
+Path: route (GPU) -> GEMM1 -> SiLU(gate) * up -> GEMM2 -> fused post-expert norm + weighted sum.
 Numerics follow stock Marlin's write-out: bf16(bf16(acc) * global_scale_bf16) per GEMM (the raw fp32 accumulator is rounded to bf16, then multiplied by the bf16 global scale and rounded again); SiLU * up is one fp32 expression with fast-math exp and one bf16 rounding,
 the post-norm runs per slot in fp32 in ascending slot order. Split-K is deterministic: slice s writes its own fp32 partial (no atomics, no zeroing)
 and the consumer (activation / epilogue) adds the partials in slice order 0..KS-1.
@@ -27,7 +28,7 @@ void mkp_reduce(torch::Tensor part, torch::Tensor y, torch::Tensor ctl, int64_t 
 void mkp_epi(torch::Tensor y, torch::Tensor row_of_slot, torch::Tensor topk_w, torch::Tensor norm_w, torch::Tensor out, int64_t m, double eps, int64_t wf);
 void mkp_gather(torch::Tensor x, torch::Tensor xg, torch::Tensor slot_of_row, torch::Tensor ctl, int64_t max_rows);
 void mkp_act(torch::Tensor part, torch::Tensor inter, torch::Tensor ctl, int64_t max_rows, int64_t ks, int64_t ksw, torch::Tensor exp_of_row, torch::Tensor gs);
-void mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out, int64_t max_groups, int64_t K, int64_t N, int64_t KS, int64_t ksw);
+void mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out, int64_t max_groups, int64_t K, int64_t N, int64_t KS, int64_t ksw, torch::Tensor slot_of_row, int64_t use_map);
 """
 
 _MK_CUDA = r"""#include <torch/extension.h>
@@ -100,7 +101,7 @@ __device__ __forceinline__ void mk_fold(float& f, uint32_t v) { f = __uint_as_fl
 template <int G, int P>
 __global__ void __launch_bounds__(128, 1) mkg_k(const uint4* __restrict__ W, const uint2* __restrict__ Sc,
                                                 const __nv_bfloat16* __restrict__ X, const int* __restrict__ gtab, float* __restrict__ out,
-                                                const int* __restrict__ ctl, int K, int N, int KS, size_t ksw) {
+                                                const int* __restrict__ ctl, int K, int N, int KS, size_t ksw, const int* __restrict__ rmap) {
     extern __shared__ __align__(16) uint8_t mk3_smem[];
     constexpr int S = G * P;
     constexpr int PA = P / 4;
@@ -123,7 +124,8 @@ __global__ void __launch_bounds__(128, 1) mkg_k(const uint4* __restrict__ W, con
     const uint2* sp = Sc + ((size_t)e * ktt + kt0) * sst + nt * 8 + (lane & 7);
     const int arow = lane >> 1, akh = lane & 1;
     const bool av = arow < nk;
-    const __nv_bfloat16* ap = X + (size_t)(t0 + (av ? arow : 0)) * K + (size_t)kt0 * 16 + akh * 8;
+    const int xr = av ? (rmap ? (rmap[t0 + arow] >> 3) : (t0 + arow)) : 0;  // GEMM1: token row of x for route row t0 + arow; GEMM2: the row itself
+    const __nv_bfloat16* ap = X + (size_t)xr * K + (size_t)kt0 * 16 + akh * 8;
     const uint32_t a_dst = (uint32_t)(arow * 32 + ((akh ^ ((arow >> 2) & 1)) * 16));
     const int lr = lane & 15, lk = lane >> 4;
     const uint32_t a_ld = (uint32_t)(lr * 32 + ((lk ^ ((lr >> 2) & 1)) * 16));
@@ -449,14 +451,15 @@ void mkp_epi(torch::Tensor y, torch::Tensor row_of_slot, torch::Tensor topk_w, t
 
 // max_groups: worst-case group count for the call's M (shape only); warps beyond the device-side n_groups exit at once.
 void mkp_gemm(torch::Tensor W, torch::Tensor Sc, torch::Tensor X, torch::Tensor gtab, torch::Tensor ctl, torch::Tensor out,
-              int64_t max_groups, int64_t K, int64_t N, int64_t KS, int64_t ksw) {
+              int64_t max_groups, int64_t K, int64_t N, int64_t KS, int64_t ksw, torch::Tensor slot_of_row, int64_t use_map) {
     const int items = (int)(max_groups * KS * (N / 64));
     const int blocks = (items + 3) / 4;
     auto st = at::cuda::getCurrentCUDAStream();
     mkg_k<MKP_G, MKP_P><<<blocks, 128, MKP_SMEM, st>>>(reinterpret_cast<const uint4*>(W.data_ptr<int>()),
                                                        reinterpret_cast<const uint2*>(Sc.data_ptr<uint8_t>()),
                                                        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), gtab.data_ptr<int>(),
-                                                       out.data_ptr<float>(), ctl.data_ptr<int>(), (int)K, (int)N, (int)KS, (size_t)ksw);
+                                                       out.data_ptr<float>(), ctl.data_ptr<int>(), (int)K, (int)N, (int)KS, (size_t)ksw,
+                                                       use_map ? slot_of_row.data_ptr<int>() : nullptr);
 }
 """
 
@@ -532,7 +535,6 @@ class MkMoE:
             "slot_of_row": torch.zeros(rmax, dtype=torch.int32, device=device),
             "row_of_slot": torch.zeros(rmax, dtype=torch.int32, device=device),
             "exp_of_row": torch.zeros(rmax, dtype=torch.int32, device=device),
-            "xg": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),
             "inter": torch.zeros(rmax, inter, dtype=torch.bfloat16, device=device),
             "y": torch.zeros(rmax, hidden, dtype=torch.bfloat16, device=device),
             # fp32 split-K partials [KS, 8 * M, N] of the call in flight; GEMM2 reuses GEMM1's after the activation has consumed them
@@ -563,10 +565,9 @@ class MkMoE:
                     local_offset, local_offset + local_count)
         ksw1 = n_slots * 2 * MK_INTER
         ksw2 = n_slots * MK_HIDDEN
-        e.mkp_gather(x, b["xg"], b["slot_of_row"], b["ctl"], n_slots)
-        e.mkp_gemm(layer.w13, layer.w13_s, b["xg"], b["gtab"], b["ctl"], b["part"], ng, MK_HIDDEN, 2 * MK_INTER, ks, ksw1)
+        e.mkp_gemm(layer.w13, layer.w13_s, x, b["gtab"], b["ctl"], b["part"], ng, MK_HIDDEN, 2 * MK_INTER, ks, ksw1, b["slot_of_row"], 1)
         e.mkp_act(b["part"], b["inter"], b["ctl"], n_slots, ks, ksw1, b["exp_of_row"], layer.gs13)
-        e.mkp_gemm(layer.w2, layer.w2_s, b["inter"], b["gtab"], b["ctl"], b["part"], ng, MK_INTER, MK_HIDDEN, ks, ksw2)
+        e.mkp_gemm(layer.w2, layer.w2_s, b["inter"], b["gtab"], b["ctl"], b["part"], ng, MK_INTER, MK_HIDDEN, ks, ksw2, b["slot_of_row"], 0)
         e.mkp_reduce(b["part"], b["y"], b["ctl"], n_slots, ks, ksw2, b["exp_of_row"], layer.gs2)
         out = torch.empty((m, MK_HIDDEN), dtype=torch.bfloat16, device=x.device)
         e.mkp_epi(b["y"], b["row_of_slot"], topk_weights.to(torch.float32).contiguous(), norm_weight, out, m, float(norm_eps), 1 if weight_first else 0)
