@@ -198,34 +198,12 @@ def _stage_us(fn, reps=7):
     return {k: statistics.median(v) for k, v in per.items()}
 
 
-def _mk_sass(ext):
-    import collections, re, shutil, subprocess
-    tool = shutil.which("cuobjdump") or "/usr/local/cuda/bin/cuobjdump"
-    try:
-        out = subprocess.run([tool, "-sass", ext.__file__], capture_output=True, text=True, timeout=180).stdout
-    except Exception as ex:  # noqa: BLE001
-        print(f"MK5 sass unavailable: {type(ex).__name__}: {str(ex)[:120]}", flush=True)
-        return
-    for f in out.split("Function : ")[1:]:
-        name = f.split("\\n", 1)[0]
-        if "mkg_k" not in name:
-            continue
-        v = re.search(r"ILi\d+ELi\d+ELi(\d+)E", name)
-        ops = collections.Counter()
-        for line in f.splitlines():
-            m = re.match(r"\s*/\*[0-9a-f]{4}\*/\s+(?:@!?U?P\w+\s+)?([A-Z][A-Z0-9_]*)", line)
-            if m:
-                ops[m.group(1)] += 1
-        print(f"MK5 SASS variant={v.group(1) if v else '?'} total={sum(ops.values())} " + " ".join(f"{k}={n}" for k, n in ops.most_common(18)), flush=True)
-
-
 def _mk_v5check(state, weights):
     mk5, lw5, nw = state["mk"], state["mk_layer"], state["norm_w"]
     dev = nw.device
     bank = state["banks"][(0, 32)]
     a = mk5.ext.mkp_attrs()
     print("MK5 regs/local " + " ".join(f"v{i}={a[2 * i]}/{a[2 * i + 1]}B" for i in range(len(a) // 2)), flush=True)
-    _mk_sass(mk5.ext)
     ns = {}
     exec(compile(_MK_REF_SRC, "mk_moe_v2", "exec"), ns)
     mk2 = ns["MkMoE"]().build(dev).alloc(256, 8, 4096, 4096, dev)
