@@ -17,4 +17,4 @@ Leaderboard (okc leaderboard): overall rank 127 (4 problems). Earlier today the 
 Checks run this round: 4 (attn Madhavan 2.600x, proj Madhavan 1.475x, layer vjeux 2.101x, moe vjeux 2.346x). None beats the sub_pub1 path; no new submission candidate.
 
 ## 2026-10-30 04:58 UTC: MoE port round (serving prize work, no board submission)
-Five off-board checks on muse_moe_w4a16 (v3/v4 hot kernel, v5 pipe mix, v6 gather removal, clean sub_mk4). Board entries unchanged: attention 2.580x, decode_layer 2.136x, moe 2.339x, bf16_proj 1.500x (sub_pub1 files). Rank is not re-read here (no board change; last read: overall 127).
+Five off-board checks on muse_moe_w4a16 (v3/v4 hot kernel, v5 pipe mix, v6 gather removal, clean sub_mk4). Board entries unchanged: attention 2.580x, decode_layer 2.136x, moe 2.339x, bf16_proj 1.500x (sub_pub1 files). Overall rank read after the round: 129 (was 127; others moved, our entries did not).
