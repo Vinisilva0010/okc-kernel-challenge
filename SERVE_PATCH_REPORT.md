@@ -167,3 +167,28 @@ tools/check_patch_rules.py: RULES OK; py_compile ok for all four files; `git app
 2. Nondeterminism: closed (bitwise run-to-run in all tested M).
 3. Startup build (8 ranks, load_inline), CUDA-graph capture inside SGLang, shared scratch buffers across streams, weight reload: unchanged from the first report; none testable here.
 4. Speed margin: overall 1.351x in phase 1 (decode 32 only 1.08x); the serving gain at concurrency 32 will be small.
+
+
+# v3 round (Oct 30): MoE port study; only the gather removal is adopted (patch now carries mk_moe v6)
+
+Question of the round: can the public MoE techniques (PUBLIC_REFS.md step 4b, ranking in MOE_PORT_PLAN.md) be applied to the Marlin-layout path without a second weight copy and with v2's numerics? Five judge checks (muse_moe_w4a16, off the board, 12 of 20 left afterwards).
+
+| check | job | what | result |
+|---|---|---|---|
+| 1 | 08d246562aee43ce | v3 hot-expert kernel (1 producer warp dequantizes each tile once into a smem fragment ring, 4 consumer warps = 4 token groups) | compiles, no deadlock, **bitwise == v2** at M = 1..256; graph us M=128 314 -> 396, M=256 426 -> 526 (**slower**) |
+| 2 | 59a50e3e6ccf4c94 | v4 = same with 4 producer warps | bitwise == v2; M=256 431 -> 541 (hot kernel 215 us vs 207 us: producer count irrelevant) |
+| 3 | fe4ba01c7dc94c44 | v5: Marlin dequant shifts moved from the INT pipe to IMAD / IMAD.HI (runtime-opaque multipliers), 3 variants | bitwise == v2; every variant **slower** (V1 +5..7%, V2 +14..16%, V3 +27..31% at M >= 16) |
+| 4 | be1f321646344708 | v6: GEMM1 reads x rows through slot_of_row, no gather kernel, no xg buffer | bitwise == v2; **-1.0..-1.9 us per call** at all six shapes; scratch 176 -> 160 MB |
+| 5 | 2515725e18324d30 | official clean file sub_mk4.py (= adopted mk_moe.py v6) | 5/5, overall **1.372x** (decode1 1.634, decode16 1.280, decode32 1.086, verify1 1.324, verify16 1.504, verify32 1.477); v2 job 3a3931cb was 1.351x: inside the +-2% noise, so no speed claim beyond the 1-2 us per call measured in check 4 |
+
+Findings (each from a job above, nothing assumed):
+1. **Sharing the dequant of a hot expert through shared memory does not pay.** The hot kernel takes ~26 us per 4-group chunk (207 us / ~8 chunks at M = 256), the same as four plain passes (~7 us each), and quadrupling the producers changed nothing. The shared operand is the dequantized bf16 fragment (2 KB per lane-tile per group vs the 512 B packed tile), so the smem traffic per group-tile grows (~3.4 KB vs ~2.1 KB) instead of the instruction count shrinking. Register-level sharing failed earlier (NT2/NT4, regs 136/208). The 13x duplicate dequant of the hot expert at verify32 therefore stays.
+2. **The INT-pipe-bound model was wrong.** Replacing SHF by IMAD / IMAD.HI is monotonically slower; the Marlin dequant mix is not improvable that way. (An attempt to read the SASS histogram through cuobjdump was rejected by the judge: "starts processes". No SASS was seen.)
+3. The public kernels' advantage rests on a layout that is not Marlin's (bit-spread codes, 7 INT + 2 IMAD per 8 weights, 1 launch, weights as the A operand with x in registers, wgmma for >= 17 tokens). Their kernel cannot read the Marlin tensors (fp32 global scale and raw nibble order are gone, parity rounding would change) and needs up to four weight copies (~3.6 GB per layer and GPU).
+   The structurally feasible port is an RS-wgmma kernel reading Marlin words as A fragments (one word = one m16k16 A fragment of two n-blocks); it is not started (days of work, accumulation order no longer bitwise v2).
+
+## Patch state after this round
+`mk_moe/mk_moe.py` = v6 (v2 frozen as mk_moe_v2.py, v3/v4/v5 kept as records: bitwise-equal but slower, or variants). Generators rerun (`tools/build_sub_mk4.py` wrote sub_mk4.py and the SGLang module; module byte-identical to mk_moe.py, cmp).
+serve/patch.diff regenerated with `git diff a55ab7d5 HEAD -- python` in serve/sglang (nested commit 9d0a99c): 4 files, 650 added lines, longest 268 chars, 37,733 bytes, 0 non-ASCII lines; tools/check_patch_rules.py: RULES OK; py_compile ok for all four files; `git apply --check -R` clean.
+Risks for Nov 5: unchanged from the v2 section (numerics ~1e-4..1e-3 from stock, deterministic, startup build, graph capture inside SGLang untested). New: the GEMM1 A-operand now indexes x through `slot_of_row[row] >> 3`; routes outside the local range never appear in `slot_of_row`, so no new out-of-range read (same rows as v2's gather).
+Honest size of the result: the serving MoE is still ~1.35-1.37x vs stock in the phase-1 judge (public kernels 2.3-2.8x); this round bought 1-2 us per call and four documented negatives.
