@@ -1,0 +1,285 @@
+
+
+# ===========================================================================================================
+# proj_mk: fixed-table serving API (code below is new; everything above is vjeux/okc-2026 sub_pub1 kernel code)
+#
+# One ``ProjHandle`` per projection weight (qkv_gate, o, pooler, unpooler, router). Differences from the
+# public ``prepare()/kernel_fn()`` pair:
+#   * the route per (layer, token bucket) is the FIXED table ROUTES_* below, read off the judge's autotune log of
+#     the 1.499x board run (job 65a6e80c32b04437), not timed at load: every process and every run takes the same
+#     route, so outputs are deterministic for a given shape;
+#   * only the layouts the table needs are built; the compressed weights are verified to decode back to the
+#     original BF16 bits (``sk2_roundtrip_ok``) before any kernel may read them;
+#   * the caller keeps its own BF16 weight: ``run()`` returns None for every shape not in the table (prefill,
+#     M > 256, buckets where cuBLAS won or tied) and the caller then runs its stock path;
+#   * nothing is compiled, allocated or synchronised in ``run()`` apart from the fresh output tensor.
+# ===========================================================================================================
+SELFTEST_ROWS = (1, 8, 16, 32, 33, 128, 200, 256)
+
+# route per (layer, bucket); a missing bucket means "stock path" (None). Bucket = _tm(m).
+ROUTES_SERVING = {
+    "qkv_gate": {8: "sk2", 16: "sk2", 32: "sk2", 128: "gqx"},
+    "o": {8: "sk2", 16: "sk2", 32: "sk2"},
+    "pooler": {8: "sk2", 16: "sk2", 32: "sk2", 128: "gq"},
+    "unpooler": {16: "sk2", 32: "sk2"},   # m <= 8 is the 1024-row slice in phase 1; serving runs the full weight there
+    "router": {16: "sk2", 32: "sk2", 128: "rk", 256: "rk"},   # m <= 8 stays stock (fp32 F.linear)
+}
+# phase-1 shapes (check file only): adds m = 1 GEMVs and the unpooler's 1024-row slice at m <= 8
+ROUTES_PHASE1 = {
+    "qkv_gate": {1: "cgemv", 8: "sk2", 16: "sk2", 32: "sk2", 128: "gqx"},
+    "o": {1: "cgemv", 8: "sk2", 16: "sk2", 32: "sk2"},
+    "pooler": {1: "cgemv", 8: "sk2", 16: "sk2", 32: "sk2", 128: "gq"},
+    "unpooler": {1: "cgemv", 8: "sk2", 16: "sk2", 32: "sk2"},
+    "router": {1: "rgemv", 8: "sk2", 16: "sk2", 32: "sk2", 128: "rk", 256: "rk"},
+}
+PROJ_SHAPES = {"qkv_gate": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096), "router": (256, 8192)}
+PROJ_MAX_M = 256
+
+_shared = {}
+
+
+def _tm(m, phase1):
+    if m < 1 or m > PROJ_MAX_M:
+        return None
+    if m == 1 and phase1:
+        return 1
+    return 8 if m <= 8 else 16 if m <= 16 else 32 if m <= 32 else 128 if m <= 128 else 256
+
+
+def sk2_decompress(comp, n, k):
+    """Inverse of sk2_compress: BF16 bits (int16 [n, k]) rebuilt from the packed bytes plus the escape list."""
+    T, U = n // 8, k // 64
+    p = comp["packed"].view(T, U, 768)
+    low = p[..., :512].to(torch.int32).reshape(T, U, 32, 16)
+    codes = p[..., 512:].reshape(T, U, 32, 8).to(torch.int32)
+    w0, w1 = codes[..., 0:4], codes[..., 4:8]
+    c8 = torch.cat([w0 & 15, w0 >> 4, w1 & 15, w1 >> 4], dim=-1)
+    base = int(comp["base4"]) & 0xFF
+    hi = (((c8 >> 3) << 7) | (base + (c8 & 7)))
+    bits = (hi << 8) | low
+    bits = ((bits + 32768) & 0xFFFF) - 32768
+    tu = bits.to(torch.int16).view(T, U, 8, 4, 4, 2, 2)   # [tile, unit, g, t, j, h, p]
+    wb = tu.permute(0, 2, 1, 4, 5, 3, 6).reshape(n, k).contiguous()
+    rows, cols = comp["rows"], comp["cols"]
+    if rows.numel():
+        eb = ((comp["wbits"] + 32768) & 0xFFFF) - 32768
+        wb[rows, cols] = eb.to(torch.int16)
+    return wb
+
+
+def sk2_roundtrip_ok(w, comp):
+    """True iff decoding the packed weights reproduces every BF16 bit of w."""
+    n, k = w.shape
+    return bool(torch.equal(sk2_decompress(comp, n, k), w.contiguous().view(torch.int16)))
+
+
+def _shared_for(dev):
+    key = (dev.type, dev.index)
+    if key not in _shared:
+        _shared[key] = {"dummy": torch.zeros(2, dtype=torch.int32, device=dev),
+                        "nsm": torch.cuda.get_device_properties(dev).multi_processor_count}
+    return _shared[key]
+
+
+def _sk2_prepare_layer(name, w, state, picks):
+    """Build the sk2 streams for the configs in ``picks`` (names of SK2_CONFIGS entries) of one weight; verifies the
+    compression round trip. Raises RuntimeError when the weight cannot be packed or the round trip fails."""
+    state["sk2"] = {}
+    shared, bal = {}, {}
+    comp_full = None
+    for ci, cfg in enumerate(SK2_CONFIGS):
+        cname, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
+        if layer != name or cname not in picks:
+            continue
+        if layer == "router":
+            hi = w.to(torch.bfloat16)
+            lo = (w - hi.float()).to(torch.bfloat16)
+            T, U = w.shape[0] // 8, w.shape[1] // 64
+            tub = torch.cat([sk2_tileunits(hi).contiguous().view(torch.uint8).reshape(T, U, 1024),
+                             sk2_tileunits(lo).contiguous().view(torch.uint8).reshape(T, U, 1024)], dim=-1)
+            stream = sk2_stream(tub, n_rows, R, NT, NWR, WSK, UPW)
+            state["sk2"][cname] = (ci, stream, state["dummy"], 0, 0, n_rows)
+            continue
+        perm = None
+        if SK2_BALANCE and CL == 1 and layer in SK2_BALANCE_LAYERS:
+            pkey = (n_rows, R)
+            if pkey not in bal:
+                pr = sk2_balance_perm(w, n_rows, R)
+                wp = w[:n_rows][pr].contiguous()
+                c = sk2_compress(wp)
+                if c is None or not sk2_roundtrip_ok(wp, c):
+                    raise RuntimeError(f"{name}: balanced packing failed or does not round-trip")
+                bal[pkey] = (pr, c)
+            perm, comp = bal[pkey]
+        else:
+            if comp_full is None:
+                comp_full = sk2_compress(w.contiguous())
+                if comp_full is None or not sk2_roundtrip_ok(w, comp_full):
+                    raise RuntimeError(f"{name}: packing failed or does not round-trip")
+            comp = comp_full
+        lkey = (n_rows, R, NT, NWR, WSK, UPW, perm is not None)
+        if lkey not in shared:
+            tab, pmax = sk2_table(comp, n_rows, R)
+            if perm is not None:
+                tab, pmax = sk2_table_add_perm(tab, pmax, perm, R)
+            shared[lkey] = (sk2_stream(comp["packed"], n_rows, R, NT, NWR, WSK, UPW), tab, pmax)
+        stream, tab, pmax = shared[lkey]
+        state["sk2"][cname] = (ci, stream, tab, pmax, comp["base4"], n_rows)
+    state["roundtrip"] = True
+
+
+class ProjHandle:
+    """One projection weight bound to the fixed route table. ``run(x)`` returns the output or None (stock path)."""
+
+    def __init__(self, name, weight, phase1=False):
+        self.name, self.phase1 = name, phase1
+        self.weight = weight   # the caller's own tensor (never copied, never modified)
+        self.routes = dict((ROUTES_PHASE1 if phase1 else ROUTES_SERVING)[name])
+        self.n, self.k = weight.shape
+        self.disabled = set()
+        self.extra_bytes = 0
+        self.roundtrip = None
+        dev = weight.device
+        sh = _shared_for(dev)
+        self.state = state = {"raw": {name: weight}, "dummy": sh["dummy"], "nsm": sh["nsm"], "sm90": True, "sk2": {}, "cg": {}}
+        before = torch.cuda.memory_allocated(dev)
+        _get_ext()
+        used = set(self.routes.values())
+        if "sk2" in used:
+            picks = {SK2_PICK[(name, tr)] for tr in (8, 16, 32) if _tm(tr, False) in self.routes and self.routes[_tm(tr, False)] == "sk2"}
+            if name == "unpooler" and not phase1:
+                picks.discard("slice8_r192")
+            _sk2_prepare_layer(name, weight, state, picks)
+            self.roundtrip = True
+        if "cgemv" in used:
+            wc = weight[:UNPOOLER_SLICE_ROWS] if name == "unpooler" else weight
+            cg = cg_compress(wc.contiguous(), CG_CONFIGS[name][0])
+            if cg is None:
+                self.routes.pop(1)
+            else:
+                state["cg"][name] = cg
+        if "rk" in used:
+            hi = weight.to(torch.bfloat16)
+            lo = (weight - hi.float()).to(torch.bfloat16)
+            state["router_cat"] = torch.cat([hi, lo], dim=1).contiguous()
+            state["rk_zc"] = torch.zeros(8, dtype=torch.int32, device=dev)
+        torch.cuda.synchronize(dev)
+        self.extra_bytes = torch.cuda.memory_allocated(dev) - before
+        self.enabled = True
+        self._selftest()
+
+    def route(self, m, n=None):
+        tm = _tm(m, self.phase1)
+        if tm is None:
+            return None
+        r = self.routes.get(tm)
+        if r is None or tm in self.disabled:
+            return None
+        if tm == 256 and m != 256 and self.name != "router":
+            return None   # untuned m in 129..255: stock call (the m = 256 picks lose to cuBLAS at partial tiles)
+        if self.name == "unpooler" and self.phase1 and tm in (1, 8) and n != UNPOOLER_SLICE_ROWS:
+            return None
+        if r == "gq" and (self.name, _gq_bn(m)) not in GQ_CONFIGS:
+            return None
+        if r == "gqx" and (self.name, _gqx_bn(m)) not in GQX_CONFIGS:
+            return None
+        if r == "sk2" and _sk2_name(self.name, m) not in self.state["sk2"]:
+            return None
+        return r
+
+    def _run(self, r, x, n):
+        st, name, m = self.state, self.name, x.shape[0]
+        if r == "sk2":
+            return _run_sk2(x, name, m, n, self.k, st)
+        if r == "gq":
+            return _run_gq(x, name, m, n, self.k, st)
+        if r == "gqx":
+            return _run_gqx(x, name, m, n, self.k, st)
+        if r == "cgemv":
+            cg = st["cg"][name]
+            rows, nth = CG_CONFIGS[name]
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+            _get_ext().cgemv(cg["L"], cg["C"], x, cg["tab"], cg["pmax"], out, cg["base4"], rows, nth)
+            return out
+        if r == "rgemv":
+            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+            _get_ext().rgemv(self.weight, x, out, m)
+            return out
+        if r == "rk":
+            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+            _get_ext().rk(st["router_cat"], x, out, _rk_splits(m, st["nsm"]), st["rk_zc"])
+            return out
+        return None
+
+    def run(self, x, n=None):
+        """x: bf16 [m, k], contiguous. Returns [m, n] (bf16; fp32 for the router) or None for the stock path."""
+        if not self.enabled or x.dim() != 2 or x.dtype != torch.bfloat16 or x.shape[1] != self.k:
+            return None
+        if not x.is_contiguous() or x.data_ptr() % 16 or x.device != self.weight.device:
+            return None
+        n = self.n if n is None else n
+        r = self.route(x.shape[0], n)
+        if r is None:
+            return None
+        return self._run(r, x, n)
+
+    def _selftest(self):
+        """Run every routed bucket once against an FP64 reference; a route that disagrees is disabled (stock path)."""
+        dev = self.weight.device
+        g = torch.Generator(device=dev)
+        g.manual_seed(SELFTEST_SEED)
+        ms = [m for m in SELFTEST_ROWS if self.route(m, UNPOOLER_SLICE_ROWS if (self.name == "unpooler" and m <= 8) else None)]
+        if not ms:
+            return
+        nn_ = UNPOOLER_SLICE_ROWS if (self.name == "unpooler" and self.phase1) else self.n
+        xs = torch.randn(max(ms), self.k, device=dev, generator=g).to(torch.bfloat16)
+        refs = {}
+        wd = self.weight.double()
+        for m in ms:
+            nn = nn_ if m <= 8 else self.n
+            ref = xs[:m].double() @ wd[:nn].T
+            refs[m] = ref if self.name == "router" else ref.to(torch.bfloat16).double()
+        del wd
+        tol = 2e-5 if self.name == "router" else 5e-3
+        for m in ms:
+            nn = nn_ if m <= 8 else self.n
+            x = xs[:m].contiguous()
+            tm = _tm(m, self.phase1)
+            try:
+                out = self._run(self.route(m, nn), x, nn).double()
+                torch.cuda.synchronize(dev)
+                err = float((out - refs[m]).norm() / refs[m].norm())
+            except RuntimeError as e:   # launch failure: fall back to the stock path
+                err = float("inf")
+                print(f"[proj_mk] selftest {self.name} m={m}: {str(e)[:120]}", file=sys.stderr)
+            if not err < tol:
+                self.disabled.add(tm)
+                print(f"[proj_mk] selftest {self.name} m={m}: rel err {err:.3e} -> bucket {tm} off (stock path)", file=sys.stderr)
+
+
+def bind_projection(name, weight, phase1=False):
+    """Build the handle for one projection weight, or return None (stock path stays) when the weight is not exactly
+    the expected shape/dtype, the GPU is not sm_90, or anything fails (the exception is logged, never raised)."""
+    try:
+        shape = PROJ_SHAPES.get(name)
+        want = torch.float32 if name == "router" else torch.bfloat16
+        if (shape is None or tuple(weight.shape) != shape or weight.dtype != want or not weight.is_cuda
+                or not weight.is_contiguous() or torch.cuda.get_device_capability(weight.device)[0] != 9):
+            return None
+        return ProjHandle(name, weight, phase1)
+    except Exception as ex:   # noqa: BLE001  (no nvcc / build error / packing refused: the stock path serves everything)
+        print(f"[proj_mk] {name}: not bound ({type(ex).__name__}: {str(ex)[:200]})", file=sys.stderr)
+        return None
+
+
+RK_SPLITS = {1: 16, 2: 12, 3: 10, 4: 8}   # token tiles of 64 -> K splits (grid 4 x ntt x S <= 128)
+
+
+def _rk_splits(m, nsm=132):
+    """K splits for m tokens: the measured table, capped so the grid (4 x ntt x S, one CTA per SM, all resident) fits the GPU."""
+    ntt = (m + 63) // 64
+    return max(1, min(RK_SPLITS[ntt], nsm // (4 * ntt)))
+
+
+def _mt_key(m):   # needed by _tma_srcs (the extension still compiles every kernel family of the public file)
+    return 0 if m == 1 else 1 if m <= 8 else 2 if m <= 16 else 4 if m <= 32 else 8
