@@ -2943,7 +2943,7 @@ def _sk2_src(sm90):
     for ci, cfg in enumerate(SK2_CONFIGS):
         name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
         for tokr in (8, 16, 32):
-            if SK2_PICK.get((layer, tokr)) != name:
+            if SK2_PICK.get((layer, tokr)) != name and SK2_PICK_LEAN.get((layer, tokr)) != name:
                 continue
             hl, nstage = _sk2_geom(cfg, tokr)
             mt = 2 if tokr == 32 else 1
@@ -3182,6 +3182,12 @@ def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
 #   * nothing is compiled, allocated or synchronised in ``run()`` apart from the fresh output tensor.
 # ===========================================================================================================
 SELFTEST_ROWS = (1, 8, 16, 32, 33, 128, 200, 256)
+SK2_PICK_LEAN = dict(SK2_PICK)   # one stream per weight: o / pooler / unpooler use their m = 32 layout for every token bucket
+for _tr in (8, 16, 32):
+    SK2_PICK_LEAN[("o", _tr)] = SK2_PICK[("o", 32)]
+    SK2_PICK_LEAN[("pooler", _tr)] = SK2_PICK[("pooler", 32)]
+SK2_PICK_LEAN[("unpooler", 16)] = SK2_PICK[("unpooler", 32)]
+SK2_PICK_LEAN[("unpooler", 32)] = SK2_PICK[("unpooler", 32)]
 
 # route per (layer, bucket); a missing bucket means "stock path" (None). Bucket = _tm(m).
 ROUTES_SERVING = {
@@ -3201,6 +3207,9 @@ ROUTES_PHASE1 = {
 }
 PROJ_SHAPES = {"qkv_gate": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096), "router": (256, 8192)}
 PROJ_MAX_M = 256
+# Weights the serving plan binds. The unpooler is left out: stock keeps m <= 8 (fused all-gather GEMM) and m >= 33, it gains 3.5-4.7 us only at
+# m 9..32 and costs 48 MB per layer (~3 GB per GPU). Add "unpooler" here to bind it (the table has its m = 16 / 32 buckets).
+SERVING_WEIGHTS = ("qkv_gate", "o", "pooler", "router")
 
 _shared = {}
 
@@ -3298,10 +3307,17 @@ def _sk2_prepare_layer(name, w, state, picks):
 class ProjHandle:
     """One projection weight bound to the fixed route table. ``run(x)`` returns the output or None (stock path)."""
 
-    def __init__(self, name, weight, phase1=False):
+    def __init__(self, name, weight, phase1=False, lean=True, router_big="gemm"):
         self.name, self.phase1 = name, phase1
+        self.pick = SK2_PICK_LEAN if lean else SK2_PICK
         self.weight = weight   # the caller's own tensor (never copied, never modified)
         self.routes = dict((ROUTES_PHASE1 if phase1 else ROUTES_SERVING)[name])
+        if name == "router":   # m 33..256: 'rk' (fast, not bitwise reproducible), 'gemm' (wgmma split-K) or None (stock)
+            for tb in (128, 256):
+                if router_big is None:
+                    self.routes.pop(tb, None)
+                else:
+                    self.routes[tb] = router_big
         self.n, self.k = weight.shape
         self.disabled = set()
         self.extra_bytes = 0
@@ -3313,9 +3329,7 @@ class ProjHandle:
         _get_ext()
         used = set(self.routes.values())
         if "sk2" in used:
-            picks = {SK2_PICK[(name, tr)] for tr in (8, 16, 32) if _tm(tr, False) in self.routes and self.routes[_tm(tr, False)] == "sk2"}
-            if name == "unpooler" and not phase1:
-                picks.discard("slice8_r192")
+            picks = {self.pick[(name, tr)] for tr in (8, 16, 32) if self.routes.get(tr) == "sk2"}
             _sk2_prepare_layer(name, weight, state, picks)
             self.roundtrip = True
         if "cgemv" in used:
@@ -3325,10 +3339,18 @@ class ProjHandle:
                 self.routes.pop(1)
             else:
                 state["cg"][name] = cg
-        if "rk" in used:
+        if "gemm" in used:
+            floats = 0
+            for (ln, bn), (nwg, splits, _st) in GEMM_CONFIGS.items():
+                if ln == "router":
+                    floats = max(floats, (self.n // (64 * nwg)) * splits * (nwg * 128) * (bn // 2))
+            state["mid_ws"] = torch.empty(floats, dtype=torch.float32, device=dev)
+            state["mid_cnt"] = torch.zeros(self.n // 16, dtype=torch.int32, device=dev)
+        if "rk" in used or "gemm" in used:
             hi = weight.to(torch.bfloat16)
             lo = (weight - hi.float()).to(torch.bfloat16)
             state["router_cat"] = torch.cat([hi, lo], dim=1).contiguous()
+            del hi, lo
             state["rk_zc"] = torch.zeros(8, dtype=torch.int32, device=dev)
         torch.cuda.synchronize(dev)
         self.extra_bytes = torch.cuda.memory_allocated(dev) - before
@@ -3350,14 +3372,24 @@ class ProjHandle:
             return None
         if r == "gqx" and (self.name, _gqx_bn(m)) not in GQX_CONFIGS:
             return None
-        if r == "sk2" and _sk2_name(self.name, m) not in self.state["sk2"]:
+        if r == "sk2" and self.pick[(self.name, _sk2_tokr(m))] not in self.state["sk2"]:
             return None
         return r
 
     def _run(self, r, x, n):
         st, name, m = self.state, self.name, x.shape[0]
         if r == "sk2":
-            return _run_sk2(x, name, m, n, self.k, st)
+            ci, stream, tab, pmax, b4, _nr = st["sk2"][self.pick[(name, _sk2_tokr(m))]]
+            out = torch.empty((m, n), dtype=torch.float32 if name == "router" else torch.bfloat16, device=x.device)
+            _get_ext().sk2(stream, x, out, tab, pmax, b4, m, n, self.k, ci, _sk2_tokr(m), 0, st["dummy"])
+            return out
+        if r == "gemm":
+            bn = 64 if m <= 64 else 128 if m <= 128 else 256
+            nwg, splits, _st = GEMM_CONFIGS[(name, bn)]
+            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+            _get_ext().gemm90(st["router_cat"], st["dummy"], x, out, st["mid_ws"], st["mid_cnt"], m, n, st["router_cat"].shape[1], self.k,
+                              splits, nwg, bn, 0)
+            return out
         if r == "gq":
             return _run_gq(x, name, m, n, self.k, st)
         if r == "gqx":
@@ -3424,18 +3456,20 @@ class ProjHandle:
                 print(f"[proj_mk] selftest {self.name} m={m}: rel err {err:.3e} -> bucket {tm} off (stock path)", file=sys.stderr)
 
 
-def bind_projection(name, weight, phase1=False):
+def bind_projection(name, weight, phase1=False, lean=True, router_big="gemm"):
     """Build the handle for one projection weight, or return None (stock path stays) when the weight is not exactly
     the expected shape/dtype, the GPU is not sm_90, or anything fails (the exception is logged, never raised)."""
     try:
         shape = PROJ_SHAPES.get(name)
+        if not phase1 and name not in SERVING_WEIGHTS:
+            return None
         want = torch.float32 if name == "router" else torch.bfloat16
         if (shape is None or tuple(weight.shape) != shape or weight.dtype != want or not weight.is_cuda
                 or not weight.is_contiguous() or torch.cuda.get_device_capability(weight.device)[0] != 9):
             return None
-        return ProjHandle(name, weight, phase1)
+        return ProjHandle(name, weight, phase1, lean, router_big)
     except Exception as ex:   # noqa: BLE001  (no nvcc / build error / packing refused: the stock path serves everything)
-        print(f"[proj_mk] {name}: not bound ({type(ex).__name__}: {str(ex)[:200]})", file=sys.stderr)
+        print(f"[proj_mk] {name}: not bound ({type(ex).__name__}: {str(ex)[:600]})", file=sys.stderr)
         return None
 
 

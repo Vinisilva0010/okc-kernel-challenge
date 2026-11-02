@@ -53,8 +53,9 @@ STUDY_CALL = '''try:
 
 STUDY = '''
 
-# ---- CHECK-only study (never part of a submitted file): memory of the layouts, round trip, serving-plan parity vs stock.
-_STUDY_M = (2, 7, 8, 9, 16, 24, 32, 33, 64, 128, 200, 256, 257)
+# ---- CHECK-only study (never part of a submitted file): memory of the layouts, timing vs stock, serving-plan parity.
+_STUDY_M = (7, 9, 16, 32, 33, 128, 256)
+_TIME_M = (8, 16, 32, 128, 256)
 
 
 def _rel(a, b):
@@ -62,52 +63,83 @@ def _rel(a, b):
     return float((a - b).norm() / b.norm().clamp_min(1e-30)), float((a - b).abs().max()), float((a != b).float().mean()) * 100
 
 
+def _graph_us(fn, flush, sink, reps=24):
+    fn()
+    torch.cuda.synchronize()
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        fn()
+    ts = []
+    for _ in range(reps):
+        torch.sum(flush, dim=0, out=sink)
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        gr.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1))
+    return sorted(ts)[len(ts) // 2] * 1000
+
+
 def _projmk_study(weights, state):
     from sglang.srt.layers.quantization.unquant import _bf16_gemm_dispatch_impl
 
     dev = weights["o"].device
-    tot1 = 0
     for name, h in state["h"].items():
-        if h is not None:
-            tot1 += h.extra_bytes
-            print(f"PROJMEM phase1 {name} extra_MB {h.extra_bytes / 2**20:.1f} roundtrip {h.roundtrip} off {sorted(h.disabled)}", flush=True)
-        else:
-            print(f"PROJMEM phase1 {name} NOT BOUND", flush=True)
-    print(f"PROJMEM phase1 total_MB {tot1 / 2**20:.1f}", flush=True)
-    srv, tot = {}, 0
-    for name, w in weights.items():
-        srv[name] = bind_projection(name, w, phase1=False)
-        h = srv[name]
-        if h is None:
-            print(f"PROJMEM serving {name} NOT BOUND", flush=True)
-            continue
-        tot += h.extra_bytes
-        print(f"PROJMEM serving {name} extra_MB {h.extra_bytes / 2**20:.1f} roundtrip {h.roundtrip} off {sorted(h.disabled)} routes {h.routes}", flush=True)
-    print(f"PROJMEM serving total_MB_per_layer {tot / 2**20:.1f} x62 layers = {tot * 62 / 2**30:.2f} GB", flush=True)
+        print(f"PROJMEM phase1 {name} extra_MB {0 if h is None else h.extra_bytes / 2**20:.1f} roundtrip {None if h is None else h.roundtrip} off {None if h is None else sorted(h.disabled)}", flush=True)
+    variants = {"final": dict()}
+    hs = {v: {} for v in variants}
+    for v, kw in variants.items():
+        tot = 0
+        for name, w in weights.items():
+            h = bind_projection(name, w, phase1=False, **kw)
+            hs[v][name] = h
+            if h is None:
+                print(f"PROJMEM {v} {name} NOT BOUND", flush=True)
+                continue
+            tot += h.extra_bytes
+            print(f"PROJMEM {v} {name} extra_MB {h.extra_bytes / 2**20:.1f} roundtrip {h.roundtrip} off {sorted(h.disabled)} routes {h.routes}", flush=True)
+        print(f"PROJMEM {v} total_MB_per_layer {tot / 2**20:.1f} x62 = {tot * 62 / 2**30:.2f} GB", flush=True)
+    flush = torch.ones(65536, 1024, dtype=torch.float32, device=dev)
+    sink = torch.empty(1024, dtype=torch.float32, device=dev)
     g = torch.Generator(device=dev)
     g.manual_seed(77)
     hi = weights["router"].to(torch.bfloat16)
     lo = (weights["router"] - hi.float()).to(torch.bfloat16)
     hit, lot = hi.t().contiguous(), lo.t().contiguous()
+
+    def stock(name, w, x):
+        if name == "router":
+            acc = torch.mm(x, hit, out_dtype=torch.float32)
+            acc += torch.mm(x, lot, out_dtype=torch.float32)
+            return acc
+        return _bf16_gemm_dispatch_impl(x, w, None)
+
     for name, w in weights.items():
-        h = srv.get(name)
-        if h is None:
-            continue
-        for m in _STUDY_M:
+        for m in sorted(set(_STUDY_M) | set(_TIME_M)):
             x = torch.randn(m, w.shape[1], device=dev, generator=g).to(torch.bfloat16)
-            out = h.run(x)
-            if out is None:
-                print(f"PROJSRV {name} m={m} stock", flush=True)
-                continue
-            if name == "router":
-                ref = torch.mm(x, hit, out_dtype=torch.float32)
-                ref += torch.mm(x, lot, out_dtype=torch.float32)
-            else:
-                ref = _bf16_gemm_dispatch_impl(x, w, None)
-            out2 = h.run(x)
-            torch.cuda.synchronize()
-            r = _rel(out, ref)
-            print(f"PROJSRV {name} m={m} {h.route(m)} rel {r[0]:.1e} max {r[1]:.1e} ne {r[2]:.2f}% det {bool(torch.equal(out, out2))}", flush=True)
+            ref = stock(name, w, x)
+            line = []
+            for v in variants:
+                h = hs[v][name]
+                out = None if h is None else h.run(x)
+                if out is None:
+                    line.append(f"{v}=stock")
+                    continue
+                out2 = h.run(x)
+                torch.cuda.synchronize()
+                r = _rel(out, ref)
+                line.append(f"{v}={h.route(m)} rel {r[0]:.1e} ne {r[2]:.2f}% det {bool(torch.equal(out, out2))}")
+            tline = ""
+            if m in _TIME_M:
+                ts = [f"stock {_graph_us(lambda: stock(name, w, x), flush, sink):.1f}"]
+                for v in variants:
+                    h = hs[v][name]
+                    if h is not None and h.run(x) is not None:
+                        ts.append(f"{v} {_graph_us(lambda: h.run(x), flush, sink):.1f}")
+                tline = " | us " + " ".join(ts)
+            print(f"PROJSRV {name} m={m} " + " | ".join(line) + tline, flush=True)
+    del flush
 '''
 
 clean = HEAD + MOD + GLUE.replace("    STUDY_HOOK\n", "")

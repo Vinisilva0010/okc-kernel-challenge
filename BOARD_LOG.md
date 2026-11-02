@@ -18,3 +18,9 @@ Checks run this round: 4 (attn Madhavan 2.600x, proj Madhavan 1.475x, layer vjeu
 
 ## 2026-10-30 04:58 UTC: MoE port round (serving prize work, no board submission)
 Five off-board checks on muse_moe_w4a16 (v3/v4 hot kernel, v5 pipe mix, v6 gather removal, clean sub_mk4). Board entries unchanged: attention 2.580x, decode_layer 2.136x, moe 2.339x, bf16_proj 1.500x (sub_pub1 files). Overall rank read after the round: 129 (was 127; others moved, our entries did not).
+
+## 2026-11-02: projection port, after check 1 (job 1c6488e0)
+measure_projmk1.py (fixed-table proj_mk): 9/9, 1.486x, off-board. okc leaderboard: overall rank 348 (4 problems). Board entries unchanged (bf16_proj sub_pub1 1.500x).
+
+## 2026-11-02: projection port, after check 2 (job a6dd769d)
+measure_projmk1.py (study: full vs lean, router gemm vs rk): 9/9, 1.482x, off-board. okc leaderboard: overall rank 348 (4 problems). Board entries unchanged.
