@@ -3181,7 +3181,7 @@ def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
 #     M > 256, buckets where cuBLAS won or tied) and the caller then runs its stock path;
 #   * nothing is compiled, allocated or synchronised in ``run()`` apart from the fresh output tensor.
 # ===========================================================================================================
-SELFTEST_ROWS = (1, 8, 16, 32, 33, 128, 200, 256)
+SELFTEST_ROWS = (1, 3, 8, 9, 16, 24, 32, 33, 64, 100, 128, 129, 200, 256)
 SK2_PICK_LEAN = dict(SK2_PICK)   # one stream per weight: o / pooler / unpooler use their m = 32 layout for every token bucket
 for _tr in (8, 16, 32):
     SK2_PICK_LEAN[("o", _tr)] = SK2_PICK[("o", 32)]
@@ -3412,7 +3412,7 @@ class ProjHandle:
 
     def run(self, x, n=None):
         """x: bf16 [m, k], contiguous. Returns [m, n] (bf16; fp32 for the router) or None for the stock path."""
-        if not self.enabled or x.dim() != 2 or x.dtype != torch.bfloat16 or x.shape[1] != self.k:
+        if torch.compiler.is_compiling() or not self.enabled or x.dim() != 2 or x.dtype != torch.bfloat16 or x.shape[1] != self.k:
             return None
         if not x.is_contiguous() or x.data_ptr() % 16 or x.device != self.weight.device:
             return None
