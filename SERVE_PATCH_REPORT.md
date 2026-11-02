@@ -192,3 +192,57 @@ Findings (each from a job above, nothing assumed):
 serve/patch.diff regenerated with `git diff a55ab7d5 HEAD -- python` in serve/sglang (nested commit 9d0a99c): 4 files, 650 added lines, longest 268 chars, 37,733 bytes, 0 non-ASCII lines; tools/check_patch_rules.py: RULES OK; py_compile ok for all four files; `git apply --check -R` clean.
 Risks for Nov 5: unchanged from the v2 section (numerics ~1e-4..1e-3 from stock, deterministic, startup build, graph capture inside SGLang untested). New: the GEMM1 A-operand now indexes x through `slot_of_row[row] >> 3`; routes outside the local range never appear in `slot_of_row`, so no new out-of-range read (same rows as v2's gather).
 Honest size of the result: the serving MoE is still ~1.35-1.37x vs stock in the phase-1 judge (public kernels 2.3-2.8x); this round bought 1-2 us per call and four documented negatives.
+
+
+# v4 round (Nov 2): public bf16 projection kernels in the patch (proj_mk)
+
+Task: put vjeux/okc-2026's `muse_bf16_proj` kernels (Apache-2.0, credit kept in the file header) next to the MK MoE. Nothing of SGLang could be run here; the kernels were validated through 4 phase-1 checks (4 of 8 budgeted used, 6 of 10 daily left), and the SGLang wiring is statically checked only.
+Single source of truth: `muse_bf16_proj/proj_mk/proj_mk.py` (derived once from `sub_pub1.py` by `tools/derive_proj_mk.py`, then edited only through anchored scripts `tools/patch_proj_mk_v2..v4.py`). `tools/build_sub_proj_mk.py [--study]` writes the phase-1 files (`sub_projmk1.py` clean, `measure_projmk1.py` = clean + CHECK-only study) and copies the module byte-identically to `serve/sglang/.../layers/muse_proj_mk.py` (cmp). `tools/patch_serve_proj_mk.py` applied the SGLang hooks.
+
+## Step 1: where the projections run (serve/sglang, base a55ab7d5) - read from the code, shapes equal the phase-1 shapes
+| projection | SGLang site | weight (TP8) | stock path on the judge (H200, bf16 backend `auto`) |
+|---|---|---|---|
+| qkv_gate | `MuseSpark1xAttention.qkv_proj` (`QKVOGateParallelLinear`) -> `UnquantizedLinearMethod.apply` | [2304, 8192] bf16 | `F.linear` (the dispatcher is used only for backend cutedsl) |
+| o | `o_proj` (`RowParallelLinear`, then all-reduce) -> same `apply` | [8192, 1024] | `F.linear` |
+| pooler | `MuseSpark1xMoE._forward_experts`: `bf16_gemm_dispatch(hidden, pre_expert_proj.weight)` (`gemm_ag` only on sm103) | [4096, 8192] replicated | `_bf16_gemm_dispatch_impl` -> `F.linear` |
+| unpooler | `_reduce_and_unpool`: `gemm_local`/`gemm_ag` if multicast comm supports it (m <= 8), else `bf16_gemm_dispatch(post_expert_proj.weight)` | [8192, 4096] | `F.linear` |
+| router | `forward_split2` for m > 8 (hi/lo bf16 `torch.mm`, fp32 out); m <= 8 `F.linear` on fp32 | [256, 8192] fp32 | as left |
+Consequence: the "SGLang baseline" of phase 1 (`_bf16_gemm_dispatch_impl`) IS what serving runs on this hardware. The unpooler's phase-1 shapes at m <= 8 are a 1024-row slice (the `gemm_local` output); serving runs full rows there, so those kernels cannot be reused.
+
+## Step 2: the module
+- **Fixed route table** (`ROUTES_SERVING`), read off the judge's autotune log of board job 65a6e80c32b04437, no timing at load: qkv_gate sk2 (m <= 32) + gqx (33..128); o sk2 (m <= 32); pooler sk2 (m <= 32) + gq (33..128); router sk2 (9..32) + wgmma `gemm` (33..256). Everything else returns None = the caller's stock path with SGLang's own bf16 weight: prefill, M > 256, m = 129..255 for non-router layers, router/unpooler at m <= 8, o at m >= 33, qkv/pooler at m >= 129, unpooler entirely (see memory).
+- **Dropped on purpose** (each a documented decision, measured or derived from the tune log): CUTLASS pooler m=256 (second JIT build with flashinfer headers, 3 us at one load), `torchT` K-major copies (4 GB for <= 6 %), m=1 GEMVs (DFlash verify has m >= 8), router `rk` (check 2: not bitwise reproducible, det False; `gemm` is det True, 3.4-6.3 us faster than stock instead of 10).
+- **Lossless packing verified at bind time** (`sk2_roundtrip_ok`: the packed bytes plus the escape list are decoded back and compared bit for bit with the original bf16 weight): True for all five weights in every check. A failed packing or round trip raises inside `bind_projection`, which logs and returns None (stock stays).
+- **Bind-time selftest**: every routed bucket runs once against an FP64 reference (tol 5e-3, router 2e-5) at m = 1, 3, 8, 9, 16, 24, 32, 33, 64, 100, 128, 129, 200, 256 (partial tiles included so every kernel instantiation is launched before any CUDA-graph capture); a failing bucket is switched off. Result in checks 2-3: none off.
+- **Extra memory per GPU** (`torch.cuda.memory_allocated` delta around the bind, job 8672b928): qkv_gate 27.0 MB, o 12.0, pooler 48.1, router 24.0 = **111.1 MB per layer = 6.73 GB over 62 layers** for the default set. Layouts kept in check 2's comparison: full per-bucket layouts would have cost 327.4 MB per layer (19.8 GB); the lean layout (one sk2 stream per weight) costs 0.0-0.6 us per call more. Binding the unpooler as well adds 48.0 MB per layer (+2.9 GB) for 3.5-4.7 us at m 9..32 only (`SERVING_WEIGHTS` in the module). The stock bf16 weights stay (prefill), so this is pure extra; it comes out of the KV pool, which I cannot size here.
+
+## Step 3: phase-1 check file (the generator output)
+| job | file | tests | overall | note |
+|---|---|---|---|---|
+| 65a6e80c32b04437 | sub_pub1.py (board file, autotune) | 9/9 | 1.499x | reference |
+| 1c6488e02a414a71 | measure_projmk1 (first fixed table, full layouts, rk) | 9/9 | 1.486x | CUTLASS dropped |
+| a6dd769d49d64eed | same + full/lean/gemm comparison study | 9/9 | 1.482x | noise between the two ~0.3 % |
+| 8672b92866334e50 | measure_projmk1 (final: lean, router gemm) | 9/9 | 1.433x | router verify16/32 1.6x/1.3x instead of 2.7x/2.5x |
+| e0fa30e810d84688 | **sub_projmk1.py (clean, final)** | 9/9 | **1.443x** (CI 1.422-1.465) | the generator's output |
+The ~1.50x I expected holds only for the first fixed table; the final configuration trades ~3.5 % of the phase-1 score for determinism of the router and half the memory. The board entry stays sub_pub1 (1.499x).
+PROJSRV parity of the serving plan against `_bf16_gemm_dispatch_impl` (final module, job 8672b928): bf16 buckets rel L2 3.2e-5..1.5e-4, 0.02-0.37 % of outputs differ, **not bitwise** (the earlier "bitwise at m >= 128" was the cuBLAS fallback; gqx m=128 is 1.0e-4, gq m=128 1.5e-4; gq at m = 33 and 64 was bitwise in check 1); deterministic run to run in every bucket. Router fp32 logits rel 1.1e-6..1.8e-6, deterministic. Per-call graph-replay times, stock -> final (us, cold L2): qkv m8 18.6 -> 13.7, m32 18.5 -> 14.9, m128 21.2 -> 18.6; o m8 10.6 -> 9.8; pooler m8 25.7 -> 19.3, m32 26.0 -> 19.2, m128 28.5 -> 25.9; router m16 18.9 -> 8.9, m32 19.3 -> 9.4, m128 20.1 -> 13.8, m256 20.9 -> 17.5.
+Derived (arithmetic on those numbers, assumes 62 identical MoE layers, micro-benchmark conditions): per verify step about 0.75 ms saved at M = 8, 1.3 ms at M = 32, 0.7 ms at M = 128, 0.2 ms at M = 256. Not a serving measurement.
+
+## Step 4: the hooks (git diff a55ab7d5 in serve/sglang, nested commit 2edc306)
+| file | change |
+|---|---|
+| `layers/muse_proj_mk.py` (new) | `proj_mk.py` verbatim (byte-identical, cmp) |
+| `environ.py` | `SGLANG_MUSE_PROJ_MK = EnvBool(True)` |
+| `layers/quantization/unquant.py` | `UnquantizedLinearMethod.apply`: if the layer carries `_proj_mk` and no bias, `run(x)`; None -> stock (qkv_proj, o_proj) |
+| `models/muse_spark.py` | router `forward_split2` tries `_proj_mk.run` BEFORE `_build_split2` (stock hi/lo copies are no longer built for served shapes); pooler and unpooler call sites try `_proj_pool` / `_proj_unpool`; `post_load_weights` ends with `_bind_proj_mk()` (per layer, after loading, `empty_cache`, one log line with the extra GB; any exception logs a warning and leaves stock) |
+Contract: `run(x)` returns None unless x is a 2-D, contiguous, 16-byte aligned bf16 CUDA tensor of the bound K, m in the table, not under `torch.compile`; outputs are fresh tensors (bf16, router fp32) like the stock call; no host sync, no compile, no allocation other than the output in `run`. Compile (`load_inline`, same toolchain as the MoE) and all weight layouts happen at bind time; torch's file lock serialises the 8 ranks.
+Patch checks (tools/check_patch_rules.py on serve/patch.diff): 7 files under python/sglang/, none in model_loader/, .py only; 4,199 added lines, longest 346 chars (limit 400; one over-long asm operand list in a CUDA string (495 chars in the public file) was wrapped by the derive script); 216,082 bytes (limit 720 KB); 0 non-ASCII lines; **RULES OK**; `py_compile` ok for all 7 files; `git apply --check -R` clean.
+Rules: weights stay as stock keeps them (bf16 projections lossless-compressed and verified bitwise; router hi/lo as stock does), activations bf16, fp32 accumulation, no top-k/attention change, every norm kept.
+
+## Risks for Nov 5 (new, on top of the MoE ones)
+1. Never run inside SGLang: `post_load_weights` binding order, the attribute hooks, 8-rank concurrent `load_inline` of a second extension (the public file's own comment says ~25 s of nvcc for the main build; not measured by me; torch's lock serialises), and capture of these calls inside SGLang's decode graphs are untested. Failure modes are logged warnings and the stock path, except a hung or trapping kernel.
+2. Extra 6.73 GB per GPU taken from the KV pool / hierarchical-cache headroom; unknown effect on cache hit rate at concurrency 16/32 (where only qkv m=128, pooler m=128 and the router gain anything). First serving check should read the "Muse projection kernels bound" line and the KV pool size.
+3. Numerics: ~1e-4 relative from stock on qkv/o/pooler outputs (0.02-0.4 % of bf16 values differ by an ulp), deterministic; on top of the MoE's 1e-4..1e-3. Whether the combined deviation passes "agrees as well as stock agrees with itself" is only knowable from a serving check. `SGLANG_MUSE_PROJ_MK` cannot be set by the judge, so a divergence means shrinking `SERVING_WEIGHTS` / the table or flipping the default.
+4. The router fp32 logits differ at 1e-6; a near-tie in the top-8 expert choice could flip (not observed, not tested on real activations).
+5. Shared per-layer counters (`rk` not used; router `gemm` uses a per-layer counter/workspace, `sk2` none): safe if one layer's call never overlaps itself on two streams; the router already runs on a side stream per call but the same layer is not re-entered.
+6. Weight reload / resume would leave the compressed copies stale (bound once at load), like the MoE.
