@@ -24,3 +24,6 @@ measure_projmk1.py (fixed-table proj_mk): 9/9, 1.486x, off-board. okc leaderboar
 
 ## 2026-11-02: projection port, after check 2 (job a6dd769d)
 measure_projmk1.py (study: full vs lean, router gemm vs rk): 9/9, 1.482x, off-board. okc leaderboard: overall rank 348 (4 problems). Board entries unchanged.
+
+## 2026-11-02: projection port, after check 3 (job 8672b928)
+measure_projmk1.py (final module): 9/9, 1.433x, off-board. okc leaderboard: overall rank 349 (4 problems). Board entries unchanged.
