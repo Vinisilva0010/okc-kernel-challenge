@@ -1,0 +1,238 @@
+
+
+def _pf_stats(out, ref):
+    d = (out.float() != ref.float()).float().mean().item() * 100.0
+    return f"rel={_pf_rel(out, ref):.2e} differ={d:.3f}%"
+
+
+def _pf_proj(weights, state):
+    import logging
+
+    import torch.nn as nn
+
+    dev = weights["qkv_gate"].device
+    _pf(f"torch {torch.__version__} cuda {torch.version.cuda} dev {torch.cuda.get_device_name(0)}")
+    _pf_base_check(@@BASE_PROJ@@)
+    _pf_env()
+    pm = _pf_load("sglang.srt.layers.muse_proj_mk", _pf_blob(_PF_PROJ))
+    _pf(f"import ok: muse_proj_mk (patched text under the installed module name), bind_projection={hasattr(pm, 'bind_projection')}")
+    try:
+        unq = _pf_load("sglang.srt.layers.quantization.unquant", _pf_blob(_PF_UNQ))
+        _pf("import ok: unquant (whole patched module exec)")
+    except Exception as ex:  # noqa: BLE001
+        _pf(f"whole-module exec of unquant failed ({type(ex).__name__}: {str(ex)[:160]} || {_pf_tb()}); using the patched class in a copy of the installed globals")
+        unq = _pf_load_classes("sglang.srt.layers.quantization.unquant", _pf_blob(_PF_UNQ), ("UnquantizedLinearMethod",))
+    try:
+        ms = _pf_load("sglang.srt.models.muse_spark", _pf_blob(_PF_MS))
+        _pf("import ok: muse_spark (whole patched module exec)")
+    except Exception as ex:  # noqa: BLE001
+        _pf(f"whole-module exec of muse_spark failed ({type(ex).__name__}: {str(ex)[:160]} || {_pf_tb()}); using the patched classes in a copy of the installed globals")
+        ms = _pf_load_classes("sglang.srt.models.muse_spark", _pf_blob(_PF_MS), ("MuseSpark1xRouter", "MuseSpark1xMoE", "MuseSpark1xForCausalLM"))
+
+    g = torch.Generator(device=dev)
+    g.manual_seed(1234)
+
+    def rx(m, k):
+        return torch.randn(m, k, device=dev, generator=g).to(torch.bfloat16)
+
+    meth = unq.UnquantizedLinearMethod()
+    layers = {}
+    for name in ("qkv_gate", "o"):
+        lay = nn.Module()
+        lay.weight = nn.Parameter(weights[name].clone(), requires_grad=False)
+        lay._proj_mk = pm.bind_projection(name, lay.weight.data)
+        layers[name] = lay
+        _pf(f"bind {name}: handle={lay._proj_mk is not None} extra={getattr(lay._proj_mk, 'extra_bytes', 0) / 2**20:.1f} MB")
+    for name, lay in layers.items():
+        h = lay._proj_mk
+        k = lay.weight.shape[1]
+        rows = []
+        for m in (1, 7, 8, 9, 16, 24, 32, 33, 64, 100, 128, 129, 200, 256, 257, 1024):
+            x = rx(m, k)
+            routed = h.run(x) is not None
+            try:
+                out = meth.apply(lay, x)
+                ref = torch.nn.functional.linear(x, lay.weight)
+                rows.append(f"m{m}:{'MK' if routed else 'stock'} {_pf_stats(out, ref)}")
+            except Exception as ex:  # noqa: BLE001
+                rows.append(f"m{m}:{'MK' if routed else 'stock'} apply raised {type(ex).__name__}: {str(ex)[:80]}")
+        _pf(f"APPLY {name}: " + " | ".join(rows))
+        x3 = rx(8, k).view(1, 8, k)
+        _pf(f"APPLY {name}: 3-D input [1,8,K] -> run() returns {'a tensor' if h.run(x3) is not None else 'None (stock)'}")
+        xn = rx(1, 9 * k + 1).view(-1)[1:1 + 8 * k].view(8, k)
+        _pf(f"APPLY {name}: non-16B-aligned view -> run() returns {'a tensor' if h.run(xn) is not None else 'None (stock)'}")
+
+    # aliasing: results of one call must survive the next call (62 layers share nothing but must not share outputs)
+    lay = layers["qkv_gate"]
+    x1, x2 = rx(32, 8192), rx(32, 8192)
+    y1 = meth.apply(lay, x1)
+    y1c = y1.clone()
+    meth.apply(lay, x2)
+    _pf(f"ALIAS qkv output survives the next call: {bool(torch.equal(y1, y1c))}")
+
+    # router
+    r_patched = ms.MuseSpark1xRouter(8192, 256, torch.float32)
+    r_patched.weight.data = weights["router"].clone()
+    r_patched.to(dev)
+    r_stock = ms.MuseSpark1xRouter(8192, 256, torch.float32)
+    r_stock.weight.data = weights["router"].clone()
+    r_stock.to(dev)
+    r_patched._proj_mk = pm.bind_projection("router", r_patched.weight.data)
+    rows = []
+    for m in (8, 16, 32, 33, 128, 256, 257):
+        x = rx(m, 8192)
+        a = r_patched.forward_split2(x)
+        a2 = r_patched.forward_split2(x)
+        b = r_stock.forward_split2(x)
+        rows.append(f"m{m}:{'MK' if r_patched._proj_mk.run(x) is not None else 'stock'} {_pf_stats(a, b)} det={bool(torch.equal(a, a2))} dtype={a.dtype}")
+    _pf("ROUTER forward_split2 patched vs stock split2: " + " | ".join(rows))
+
+    # pooler as the patched call site uses it: handle.run(hidden_states) (stock: bf16_gemm_dispatch -> F.linear)
+    pool = pm.bind_projection("pooler", weights["pooler"].clone())
+    rows = []
+    for m in (8, 16, 32, 33, 128, 256):
+        x = rx(m, 8192)
+        o = pool.run(x)
+        rows.append(f"m{m}:{'MK' if o is not None else 'stock'}" + (f" {_pf_stats(o, torch.nn.functional.linear(x, weights['pooler']))}" if o is not None else ""))
+    _pf("POOLER run vs F.linear: " + " | ".join(rows))
+    unp = pm.bind_projection("unpooler", weights["unpooler"].clone())
+    _pf(f"UNPOOLER bind_projection returns {'a handle' if unp is not None else 'None'} (SERVING_WEIGHTS excludes it; default expected None)")
+
+    # the real _bind_proj_mk on a fake model with two MoE layers
+    logs = []
+
+    class _H(logging.Handler):
+        def emit(self, rec):
+            logs.append(f"{rec.levelname}: {rec.getMessage()[:200]}")
+
+    lg = logging.getLogger("sglang.srt.models.muse_spark")
+    hdl = _H()
+    lg.addHandler(hdl)
+    old_level = lg.level
+    lg.setLevel(logging.INFO)
+
+    def fake_model(n):
+        ls = []
+        for _ in range(n):
+            attn = _pf_types.SimpleNamespace(qkv_proj=nn.Module(), o_proj=nn.Module())
+            attn.qkv_proj.weight = nn.Parameter(weights["qkv_gate"].clone(), requires_grad=False)
+            attn.o_proj.weight = nn.Parameter(weights["o"].clone(), requires_grad=False)
+            moe = ms.MuseSpark1xMoE.__new__(ms.MuseSpark1xMoE)
+            nn.Module.__init__(moe)
+            moe.pre_expert_proj = nn.Module()
+            moe.pre_expert_proj.weight = nn.Parameter(weights["pooler"].clone(), requires_grad=False)
+            moe.post_expert_proj = nn.Module()
+            moe.post_expert_proj.weight = nn.Parameter(weights["unpooler"].clone(), requires_grad=False)
+            moe.gate = ms.MuseSpark1xRouter(8192, 256, torch.float32)
+            moe.gate.weight.data = weights["router"].clone()
+            moe.gate.to(dev)
+            moe._proj_pool = None
+            moe._proj_unpool = None
+            ls.append(_pf_types.SimpleNamespace(self_attn=attn, mlp=moe))
+        return _pf_types.SimpleNamespace(model=_pf_types.SimpleNamespace(language_model=_pf_types.SimpleNamespace(layers=ls)))
+
+    bind = ms.MuseSpark1xForCausalLM._bind_proj_mk
+    fm = fake_model(2)
+    bind(fm)
+    ls = fm.model.language_model.layers
+    got = [(l.self_attn.qkv_proj._proj_mk is not None, l.self_attn.o_proj._proj_mk is not None, l.mlp._proj_pool is not None,
+            l.mlp._proj_unpool is not None, l.mlp.gate._proj_mk is not None) for l in ls]
+    _pf(f"_bind_proj_mk (real method, fake 2-layer model) bound (qkv,o,pool,unpool,router) per layer: {got}; log: {logs[-2:]}")
+    # forced failure: no exception, stock path
+    real_bp = pm.bind_projection
+    pm.bind_projection = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("forced"))
+    try:
+        fm2 = fake_model(1)
+        logs.clear()
+        bind(fm2)
+        l0 = fm2.model.language_model.layers[0]
+        _pf(f"_bind_proj_mk forced failure: no exception, hooks left None={l0.self_attn.qkv_proj.__dict__.get('_proj_mk') is None}; log: {logs[-1:]}")
+    except Exception as ex:  # noqa: BLE001
+        _pf(f"FAIL _bind_proj_mk forced failure raised {type(ex).__name__}: {str(ex)[:120]}")
+    finally:
+        pm.bind_projection = real_bp
+    _pf_os.environ["SGLANG_MUSE_PROJ_MK"] = "0"
+    try:
+        fm3 = fake_model(1)
+        bind(fm3)
+        l0 = fm3.model.language_model.layers[0]
+        _pf(f"_bind_proj_mk with SGLANG_MUSE_PROJ_MK=0: any hook bound={any(getattr(l0.self_attn.qkv_proj, '_proj_mk', None) is not None for _ in [0]) or l0.mlp._proj_pool is not None} (expected False)")
+    finally:
+        del _pf_os.environ["SGLANG_MUSE_PROJ_MK"]
+    lg.removeHandler(hdl)
+    lg.setLevel(old_level)
+
+    # CUDA graph capture of the bound hooks, replay vs eager
+    l0 = ls[0]
+    mlp = l0.mlp
+    for m in (8, 32, 128, 256):
+        def cap(m=m):
+            xq, xo, xp, xr = rx(m, 8192), rx(m, 1024), rx(m, 8192), rx(m, 8192)
+
+            def seq():
+                a = meth.apply(l0.self_attn.qkv_proj, xq)
+                b = meth.apply(l0.self_attn.o_proj, xo)
+                c = mlp._proj_pool.run(xp) if mlp._proj_pool is not None else None
+                c = c if c is not None else torch.nn.functional.linear(xp, mlp.pre_expert_proj.weight)
+                d = mlp.gate.forward_split2(xr)
+                return a, b, c, d
+
+            eager = [t.clone() for t in seq()]
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                seq()
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                outs = seq()
+            gr.replay()
+            gr.replay()
+            torch.cuda.synchronize()
+            _pf(f"PROJ graph M={m} capture ok, replay bitwise==eager (qkv,o,pool,router): {[bool(torch.equal(a, b)) for a, b in zip(outs, eager)]}")
+        _pf_stage(f"graph M={m}", cap)
+
+    # router on a side stream while the pooler and qkv run on the main stream (as MuseSpark1xMoE does), vs serial results
+    def race():
+        side = torch.cuda.Stream()
+        xr, xp, xq = rx(32, 8192), rx(32, 8192), rx(32, 8192)
+        ref_r, ref_p, ref_q = mlp.gate.forward_split2(xr).clone(), mlp._proj_pool.run(xp).clone(), meth.apply(l0.self_attn.qkv_proj, xq).clone()
+        bad = 0
+        main = torch.cuda.current_stream()
+        for _ in range(200):
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                r = mlp.gate.forward_split2(xr)
+            p = mlp._proj_pool.run(xp)
+            q = meth.apply(l0.self_attn.qkv_proj, xq)
+            main.wait_stream(side)
+            if not (torch.equal(r, ref_r) and torch.equal(p, ref_p) and torch.equal(q, ref_q)):
+                bad += 1
+        torch.cuda.synchronize()
+        _pf(f"RACE router on a side stream next to pooler+qkv on main, 200 rounds: mismatches vs serial = {bad} (expected 0)")
+    _pf_stage("race", race)
+
+    # timing (eager, CUDA events, cached L2): patched hook vs stock F.linear
+    for m in (8, 32, 128, 256):
+        xq, xo, xp, xr = rx(m, 8192), rx(m, 1024), rx(m, 8192), rx(m, 8192)
+        wq, wo, wp = l0.self_attn.qkv_proj.weight, l0.self_attn.o_proj.weight, mlp.pre_expert_proj.weight
+        t = []
+        for f_new, f_old in (
+            (lambda: meth.apply(l0.self_attn.qkv_proj, xq), lambda: torch.nn.functional.linear(xq, wq)),
+            (lambda: meth.apply(l0.self_attn.o_proj, xo), lambda: torch.nn.functional.linear(xo, wo)),
+            (lambda: mlp._proj_pool.run(xp), lambda: torch.nn.functional.linear(xp, wp)),
+            (lambda: mlp.gate.forward_split2(xr), lambda: r_stock.forward_split2(xr)),
+        ):
+            t.append(f"{_pf_events(f_new):.1f}/{_pf_events(f_old):.1f}")
+        _pf(f"PROJ time M={m} patched/stock us (qkv, o, pooler, router): " + " ".join(t))
+
+
+def prepare(weights):
+    state = _prepare_base(weights)
+    try:
+        _pf_proj(weights, state)
+    except Exception:  # noqa: BLE001
+        _pf("FATAL proj preflight: " + _pf_tb())
+    torch.cuda.synchronize()
+    return state

@@ -1,0 +1,124 @@
+
+
+# ============================================================================================ PREFLIGHT (CHECK-only, never submitted)
+# Smoke test of the patched SGLang files inside the judge image (same image and SGLang commit as serving). The patched texts are embedded
+# (zlib+base64), written to a temp dir and loaded with importlib under the installed module names. Everything prints "PREFLIGHT ...".
+import ast as _pf_ast
+import base64 as _pf_b64
+import importlib as _pf_il
+import importlib.util as _pf_ilu
+import os as _pf_os
+import sys as _pf_sys
+import tempfile as _pf_tmp
+import traceback as _pf_trace
+import types as _pf_types
+import zlib as _pf_zlib
+
+_PF_DIR = _pf_tmp.mkdtemp(prefix="pf_")
+
+
+def _pf(msg):
+    print("PREFLIGHT " + msg, flush=True)
+
+
+def _pf_tb():
+    return " | ".join(_pf_trace.format_exc().strip().splitlines()[-5:])[-700:]
+
+
+def _pf_blob(b64):
+    return _pf_zlib.decompress(_pf_b64.b64decode(b64)).decode()
+
+
+def _pf_rel(a, b):
+    a = a.float()
+    b = b.float()
+    return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+
+def _pf_stage(label, fn, *args):
+    try:
+        return fn(*args)
+    except Exception as ex:  # noqa: BLE001
+        _pf(f"FAIL {label}: {type(ex).__name__}: {str(ex)[:200]} || {_pf_tb()}")
+        return None
+
+
+def _pf_load(name, text):
+    """Exec the patched text as module `name` (the installed module's name); the installed one is kept if the exec fails."""
+    path = _pf_os.path.join(_PF_DIR, name.replace(".", "_") + ".py")
+    with open(path, "w") as f:
+        f.write(text)
+    parent, _, leaf = name.rpartition(".")
+    pmod = _pf_il.import_module(parent)
+    spec = _pf_ilu.spec_from_file_location(name, path)
+    mod = _pf_ilu.module_from_spec(spec)
+    old = _pf_sys.modules.get(name)
+    _pf_sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        if old is not None:
+            _pf_sys.modules[name] = old
+        else:
+            _pf_sys.modules.pop(name, None)
+        raise
+    setattr(pmod, leaf, mod)
+    return mod
+
+
+def _pf_load_classes(name, text, names):
+    """Fallback when a whole-module exec fails: exec only the patched classes in a copy of the installed module's globals."""
+    import __future__
+
+    inst = _pf_il.import_module(name)
+    g = dict(vars(inst))
+    tree = _pf_ast.parse(text)
+    body = [n for n in tree.body if isinstance(n, _pf_ast.ClassDef) and n.name in names]
+    exec(compile(_pf_ast.Module(body=body, type_ignores=[]), name + "(patched)", "exec", flags=__future__.annotations.compiler_flag), g)
+    return _pf_types.SimpleNamespace(**{n: g[n] for n in names}, __name__=name)
+
+
+def _pf_env():
+    from sglang.srt import environ as E
+
+    added = []
+    for nm in ("SGLANG_MUSE_MK_MOE", "SGLANG_MUSE_PROJ_MK"):
+        if not hasattr(E.Envs, nm):
+            f = E.EnvBool(True)
+            f.name = nm
+            setattr(E.Envs, nm, f)
+            added.append(nm)
+    _pf(f"env fields added to the installed Envs (as the patched environ.py defines them): {added}; values now {[getattr(E.envs, n).get() for n in ('SGLANG_MUSE_MK_MOE', 'SGLANG_MUSE_PROJ_MK')]}")
+
+
+def _pf_base_check(expected):
+    """expected: {module name: sha1 of the file at a55ab7d5 or None for new files}. Compares with the installed files."""
+    import hashlib
+
+    out = []
+    for name, sha in expected.items():
+        try:
+            spec = _pf_ilu.find_spec(name)
+            path = spec.origin if spec is not None else None
+        except Exception:  # noqa: BLE001
+            path = None
+        if path is None or not _pf_os.path.exists(path):
+            out.append(f"{name.rsplit('.', 1)[-1]}=absent")
+            continue
+        got = hashlib.sha1(open(path, "rb").read()).hexdigest()
+        out.append(f"{name.rsplit('.', 1)[-1]}=" + ("base" if got == sha else "DIFFERS"))
+    _pf("installed files vs SGLang a55ab7d5 blobs: " + " ".join(out))
+
+
+def _pf_events(fn, iters=30, warm=5):
+    for _ in range(warm):
+        fn()
+    a = torch.cuda.Event(enable_timing=True)
+    b = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    a.record()
+    for _ in range(iters):
+        fn()
+    b.record()
+    torch.cuda.synchronize()
+    return a.elapsed_time(b) * 1000.0 / iters

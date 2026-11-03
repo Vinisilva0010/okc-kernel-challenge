@@ -1,0 +1,256 @@
+
+
+def _pf_route(m, dev, seed):
+    g = torch.Generator(device=dev)
+    g.manual_seed(seed)
+    u = torch.rand(m, 256, device=dev, generator=g)
+    u[:, :32] *= 4.0  # skew toward this GPU's 32 local experts (about 2.9 local routes per token)
+    ids = u.topk(8, dim=1).indices.to(torch.int32)
+    sc = torch.softmax(torch.randn(m, 8, device=dev, generator=g), dim=1).float()
+    x = torch.randn(m, 4096, device=dev, generator=g).to(torch.bfloat16)
+    return x, sc, ids
+
+
+def _pf_stub_globals(MQ):
+    stubs = (
+        ("get_moe_a2a_backend", lambda: _pf_types.SimpleNamespace(is_megamoe=lambda: False)),
+        ("get_moe_runner_backend", lambda: _pf_types.SimpleNamespace(is_marlin=lambda: True)),
+        ("_use_nvfp4_dispatch", lambda: False),
+    )
+    patched = []
+    for nm, stub in stubs:
+        try:
+            r = getattr(MQ, nm)()
+            if nm == "get_moe_a2a_backend":
+                r.is_megamoe()
+            if nm == "get_moe_runner_backend":
+                r.is_marlin()
+        except Exception:  # noqa: BLE001  (server globals are not initialised outside a launched server)
+            setattr(MQ, nm, stub)
+            patched.append(nm)
+    return patched
+
+
+def _pf_make_layer(fpmod, nvmod, weights, state, r_up, dev):
+    """A MuseSpark1xFp4Experts built without __init__ (that needs the distributed groups); native HF-layout tensors; then the REAL
+    MuseSparkNvFp4FusedMoEMethod.process_weights_after_loading (Marlin repack + the patched layer.bind_mk_moe())."""
+    import torch.nn as nn
+
+    cls = fpmod.MuseSpark1xFp4Experts
+    layer = cls.__new__(cls)
+    nn.Module.__init__(layer)
+    layer.use_marlin = True
+    layer.expert_tp = False
+    layer.num_experts = 32
+    layer.global_num_experts = 256
+    layer.num_local_experts = 32
+    layer.local_expert_offset = 0
+    layer.hidden_size = 4096
+    layer.intermediate_size_per_partition = 4096
+    layer.top_k = 8
+    layer.params_dtype = torch.bfloat16
+    layer.quant_config = _pf_types.SimpleNamespace(group_size=16)
+    layer.moe_runner_config = _pf_types.SimpleNamespace(is_gated=True)
+    layer._mk_moe = None
+    layer._mk_layer = None
+    layer._post_expert_norm = None
+    layer._post_expert_norm_eps = 1e-8
+    layer._post_expert_norm_weight_first = True
+    layer._fused_finalize_op = None
+    layer.register_buffer("_post_expert_norm_weight", None, persistent=False)
+    emap = torch.full((256,), -1, dtype=torch.int32, device=dev)
+    emap[:32] = torch.arange(32, dtype=torch.int32, device=dev)
+    layer.register_buffer("_expert_map", emap, persistent=False)
+    gs = weights["w13_gs"][:32].float()
+    for name, t in (
+        ("gate_up_proj", weights["w13"][:32].clone()),
+        ("down_proj", weights["w2"][:32].clone()),
+        ("gate_up_proj_weight_scale", weights["w13_sf"][:32].clone()),
+        ("down_proj_weight_scale", weights["w2_sf"][:32].clone()),
+        ("gate_up_proj_weight_scale_2", torch.stack([gs, gs * r_up], dim=1).contiguous()),
+        ("down_proj_weight_scale_2", weights["w2_gs"][:32].float().clone()),
+        ("gate_up_proj_input_scale", torch.ones(32, 2, device=dev)),
+        ("down_proj_input_scale", torch.ones(32, device=dev)),
+    ):
+        layer.register_parameter(name, nn.Parameter(t, requires_grad=False))
+    method = nvmod.MuseSparkNvFp4FusedMoEMethod.__new__(nvmod.MuseSparkNvFp4FusedMoEMethod)
+    method.quant_config = layer.quant_config
+    method._moe_runner_backend = _pf_types.SimpleNamespace(is_marlin=lambda: True)
+    method.process_weights_after_loading(layer)
+    return layer
+
+
+def _pf_make_layer_fallback(fpmod, state, dev):
+    """Used only if the real process_weights_after_loading cannot run here: attach the phase-1 Marlin tensors and call bind_mk_moe."""
+    import torch.nn as nn
+
+    cls = fpmod.MuseSpark1xFp4Experts
+    layer = cls.__new__(cls)
+    nn.Module.__init__(layer)
+    bank = state["banks"][(0, 32)]
+    for k, v in (("use_marlin", True), ("expert_tp", False), ("num_local_experts", 32), ("hidden_size", 4096),
+                 ("intermediate_size_per_partition", 4096), ("top_k", 8), ("global_num_experts", 256), ("local_expert_offset", 0),
+                 ("params_dtype", torch.bfloat16), ("_mk_moe", None), ("_mk_layer", None), ("_post_expert_norm", None),
+                 ("_post_expert_norm_eps", 1e-8), ("_post_expert_norm_weight_first", True), ("_fused_finalize_op", None)):
+        setattr(layer, k, v)
+    layer.register_buffer("_post_expert_norm_weight", None, persistent=False)
+    emap = torch.full((256,), -1, dtype=torch.int32, device=dev)
+    emap[:32] = torch.arange(32, dtype=torch.int32, device=dev)
+    layer.register_buffer("_expert_map", emap, persistent=False)
+    for k, key in (("w13_weight", "w13"), ("w13_weight_scale", "w13_s"), ("w13_weight_scale_2", "w13_gs"),
+                   ("w2_weight", "w2"), ("w2_weight_scale", "w2_s"), ("w2_weight_scale_2", "w2_gs")):
+        setattr(layer, k, _pf_types.SimpleNamespace(data=bank[key]))
+    layer.bind_mk_moe()
+    return layer
+
+
+def _pf_moe(weights, state):
+    import torch.nn as nn
+
+    dev = weights["w13"].device
+    _pf(f"torch {torch.__version__} cuda {torch.version.cuda} dev {torch.cuda.get_device_name(0)}")
+    _pf_base_check(@@BASE_MOE@@)
+    st_cls = _pf_il.import_module("sglang.srt.layers.muse_spark_fp4_moe").MuseSpark1xFp4Experts
+    _pf(f"installed MuseSpark1xFp4Experts has bind_mk_moe before loading the patched text: {hasattr(st_cls, 'bind_mk_moe')} (expected False)")
+    _pf_env()
+    mkmod = _pf_load("sglang.srt.layers.moe.muse_mk_moe", _pf_blob(_PF_MK))
+    nvmod = _pf_load("sglang.srt.layers.quantization.muse_spark_nvfp4_moe", _pf_blob(_PF_NV))
+    fpmod = _pf_load("sglang.srt.layers.muse_spark_fp4_moe", _pf_blob(_PF_FP4))
+    _pf(f"import ok: muse_mk_moe, muse_spark_nvfp4_moe, muse_spark_fp4_moe (patched text under the installed module names); has bind_mk_moe: {hasattr(fpmod.MuseSpark1xFp4Experts, 'bind_mk_moe')}")
+    from sglang.srt.layers.quantization import modelopt_quant as MQ
+
+    patched = _pf_stub_globals(MQ)
+    _pf(f"server globals stubbed for the plain process (cannot be initialised without a launched server): {patched}")
+
+    layer = None
+    try:
+        layer = _pf_make_layer(fpmod, nvmod, weights, state, 1.0, dev)
+        how = "real MuseSparkNvFp4FusedMoEMethod.process_weights_after_loading (Marlin repack + bind_mk_moe)"
+    except Exception as ex:  # noqa: BLE001
+        _pf(f"FAIL real process_weights_after_loading: {type(ex).__name__}: {str(ex)[:200]} || {_pf_tb()}")
+        layer = _pf_make_layer_fallback(fpmod, state, dev)
+        how = "FALLBACK phase-1 Marlin tensors + bind_mk_moe (real process_weights_after_loading failed above)"
+    _pf(f"bind via {how}: _mk_moe bound={layer._mk_moe is not None} _mk_layer bound={layer._mk_layer is not None}")
+    if layer._mk_moe is None:
+        _pf("STOP: bind_mk_moe left the stock path (no MK)")
+        return
+    mk = layer._mk_moe
+    _pf(f"mk scratch {mk.scratch_bytes() / 2**20:.1f} MB (shared by all layers); w13 {tuple(layer.w13_weight.data.shape)} {layer.w13_weight.data.dtype} w13_s {tuple(layer.w13_weight_scale.data.shape)} {layer.w13_weight_scale.data.dtype} gs {tuple(layer.w13_weight_scale_2.data.shape)} {layer.w13_weight_scale_2.data.dtype}")
+
+    # env flag off -> bind_mk_moe must leave the stock path
+    keep = (layer._mk_moe, layer._mk_layer)
+    _pf_os.environ["SGLANG_MUSE_MK_MOE"] = "0"
+    try:
+        layer._mk_moe = None
+        layer._mk_layer = None
+        layer.bind_mk_moe()
+        _pf(f"SGLANG_MUSE_MK_MOE=0 -> bound={layer._mk_moe is not None} (expected False)")
+    finally:
+        del _pf_os.environ["SGLANG_MUSE_MK_MOE"]
+        layer._mk_moe, layer._mk_layer = keep
+    # a failing build must not raise out of bind_mk_moe
+    real_shared = fpmod.mk_shared
+    fpmod.mk_shared = lambda device: (_ for _ in ()).throw(RuntimeError("forced"))
+    try:
+        keep = (layer._mk_moe, layer._mk_layer)
+        layer._mk_moe = None
+        layer._mk_layer = None
+        layer.bind_mk_moe()
+        _pf(f"forced build failure -> no exception, bound={layer._mk_moe is not None} (expected False)")
+    except Exception as ex:  # noqa: BLE001
+        _pf(f"FAIL forced build failure raised {type(ex).__name__}")
+    finally:
+        fpmod.mk_shared = real_shared
+        layer._mk_moe, layer._mk_layer = keep
+
+    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNormWithInputScale as NormCls
+
+    norm = NormCls(4096, eps=1e-8, zero_centered_gamma=True)
+    norm.weight = nn.Parameter(weights["post_norm_w"].float().clone(), requires_grad=False)
+    norm.to(dev)
+    calls = {"n": 0}
+    orig_fwd = mk.forward
+
+    def counted(*a, **k):
+        calls["n"] += 1
+        return orig_fwd(*a, **k)
+
+    mk.forward = counted
+
+    def fwd(x, sc, ids, use_mk):
+        saved = layer._mk_moe
+        if not use_mk:
+            layer._mk_moe = None
+        try:
+            return layer._forward_marlin(x, sc, ids, norm)
+        finally:
+            layer._mk_moe = saved
+
+    cfg_local = {"local_start": 0, "local_count": 32}
+    for m in (1, 8, 32, 128, 256, 257):
+        x, sc, ids = _pf_route(m, dev, 100 + m)
+        calls["n"] = 0
+        out = fwd(x, sc, ids, True)
+        torch.cuda.synchronize()
+        used = calls["n"]
+        out2 = fwd(x, sc, ids, True)
+        ref = fwd(x, sc, ids, False)
+        data = {"hidden_states": x, "topk_ids": ids, "topk_weights": sc, "config": {**cfg_local, "bs": m}}
+        p1 = _kernel_sglang(data, state)
+        p1mk = kernel_fn(data, state)
+        nloc = int(((ids >= 0) & (ids < 32)).sum())
+        _pf(f"MOE M={m} local_routes={nloc} mk_calls={used // 1} out={tuple(out.shape)} {out.dtype} rel(patched,stock_fwd)={_pf_rel(out, ref):.2e} rel(stock_fwd,phase1_marlin)={_pf_rel(ref, p1):.2e} "
+            f"det={bool(torch.equal(out, out2))} bitwise(patched,phase1_MK)={bool(torch.equal(out, p1mk))} finite={bool(torch.isfinite(out.float()).all())}")
+
+    # a second layer with a different up/gate global scale ratio (Marlin collapses to the gate column; the post-norm cancels the gain)
+    layer_b = _pf_stage("second layer r_up=1.7", _pf_make_layer, fpmod, nvmod, weights, state, 1.7, dev)
+    if layer_b is not None:
+        _pf(f"second layer bound={layer_b._mk_moe is not None} shares MkMoE with the first: {layer_b._mk_moe is layer._mk_moe}")
+        for m in (8, 128):
+            x, sc, ids = _pf_route(m, dev, 500 + m)
+            o_mk = layer_b._forward_marlin(x, sc, ids, norm)
+            sv = layer_b._mk_moe
+            layer_b._mk_moe = None
+            o_st = layer_b._forward_marlin(x, sc, ids, norm)
+            layer_b._mk_moe = sv
+            _pf(f"MOE layerB(r_up=1.7) M={m} rel(patched,stock_fwd)={_pf_rel(o_mk, o_st):.2e}")
+        del layer_b
+
+    # CUDA graph capture of the patched _forward_marlin (MK path), replay vs eager
+    for m in (8, 32, 128, 256):
+        def cap(m=m):
+            x, sc, ids = _pf_route(m, dev, 900 + m)
+            eager = layer._forward_marlin(x, sc, ids, norm).clone()
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(2):
+                    layer._forward_marlin(x, sc, ids, norm)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                gout = layer._forward_marlin(x, sc, ids, norm)
+            g.replay()
+            g.replay()
+            torch.cuda.synchronize()
+            _pf(f"MOE graph M={m} capture ok, replay bitwise==eager: {bool(torch.equal(gout, eager))}")
+        _pf_stage(f"graph M={m}", cap)
+
+    # timing (eager, CUDA events): patched MK path vs stock Marlin path of the same layer
+    for m in (8, 32, 128, 256):
+        x, sc, ids = _pf_route(m, dev, 700 + m)
+        t_mk = _pf_events(lambda: fwd(x, sc, ids, True))
+        t_st = _pf_events(lambda: fwd(x, sc, ids, False))
+        _pf(f"MOE time M={m}: patched {t_mk:.1f} us, stock {t_st:.1f} us (eager launches, cached L2)")
+    mk.forward = orig_fwd
+
+
+def prepare(weights):
+    state = _prepare_base(weights)
+    try:
+        _pf_moe(weights, state)
+    except Exception:  # noqa: BLE001
+        _pf("FATAL moe preflight: " + _pf_tb())
+    torch.cuda.synchronize()
+    return state
