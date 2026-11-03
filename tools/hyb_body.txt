@@ -1,0 +1,316 @@
+
+
+# ============================================================================================ HYBRID DRAFT UNIT TESTS (CHECK-only, never submitted)
+# Loads the embedded serve/sglang hybrid_draft.py from a temp file as a NEW module (nothing loaded is replaced) and tests the pure parts on the GPU.
+import array as _hy_array
+import importlib.util as _hy_ilu
+import os as _hy_os
+import tempfile as _hy_tmp
+import types as _hy_types
+import zlib as _hy_zlib
+import base64 as _hy_b64
+import traceback as _hy_tb
+
+import numpy as _hy_np
+
+
+def _hy(msg):
+    print("HYB " + msg, flush=True)
+
+
+def _hy_load():
+    d = _hy_tmp.mkdtemp(prefix="hyb_")
+    path = _hy_os.path.join(d, "hybrid_draft_under_test.py")
+    open(path, "w").write(_hy_zlib.decompress(_hy_b64.b64decode(_HY_BLOB)).decode())
+    spec = _hy_ilu.spec_from_file_location("hybrid_draft_under_test", path)
+    mod = _hy_ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _hy_seq(rng, n, vocab, kind):
+    """A token history of length n. kinds: rand (small vocab, many accidental matches), unique (no repeats), const (one token), period, copy (a block
+    copied from earlier, with the copy source straddling chunk boundaries), tailrep (the last tokens repeat a block right before them)."""
+    if kind == "unique":
+        return _hy_np.arange(1000, 1000 + n, dtype=_hy_np.int64)
+    if kind == "const":
+        return _hy_np.full(n, 7, dtype=_hy_np.int64)
+    s = rng.integers(0, vocab, size=n).astype(_hy_np.int64)
+    if kind == "period":
+        P = int(rng.integers(3, 40))
+        s = _hy_np.tile(s[:P], n // P + 1)[:n].copy()
+    elif kind == "copy" and n > 3000:
+        L = int(rng.integers(20, 200))
+        src = int(rng.choice([1023 - L + 1, 1024 - 5, 2048 - 10, 500]))
+        s[n - L:] = s[src:src + L]
+    elif kind == "tailrep" and n > 40:
+        L = int(rng.integers(2, 6))
+        s[n - L:] = s[n - 2 * L - 1:n - L - 1]
+    return s
+
+
+def _hy_test_kernels(hd, dev):
+    rng = _hy_np.random.default_rng(1234)
+    K = 7
+    bad = 0
+    total = 0
+    for width in (8192, 131072):
+        rows = 40
+        drafter = hd.HybridDrafter(rows, width, K + 1, dev, min_match=4)
+        W = drafter.W
+        kinds = ["rand", "unique", "const", "period", "copy", "tailrep"]
+        for trial in range(3):
+            bs = 32
+            seqs, slots = [], rng.permutation(_hy_np.arange(1, rows))[:bs]
+            for b in range(bs):
+                kind = kinds[(b + trial) % len(kinds)]
+                n = int(rng.choice([1, 2, 3, 5, 9, 40, 300, 1023, 1024, 1025, 3000, 6000, 20000 if width > 8192 else 8000]))
+                n = min(n, width - 2)
+                vocab = int(rng.choice([3, 8, 50, 1000]))
+                seqs.append(_hy_seq(rng, n, vocab, kind))
+            drafter.hist.zero_()
+            for b, s in enumerate(seqs):
+                drafter.hist[int(slots[b]), :len(s)] = torch.from_numpy(s.astype(_hy_np.int32)).to(dev)
+            prefix = torch.tensor([len(s) - 1 for s in seqs], dtype=torch.int64, device=dev)
+            draft = torch.from_numpy(rng.integers(0, 50, size=(bs, K + 1)).astype(_hy_np.int64)).to(dev)
+            ref_rows, ref_hits = [], []
+            for b, s in enumerate(seqs):
+                row, hit = hd.merge_reference(draft[b].tolist(), s.tolist(), 4)
+                ref_rows.append(row)
+                ref_hits.append(int(hit))
+            drafter.begin_step(bs)
+            drafter.merge(draft, torch.from_numpy(slots.astype(_hy_np.int64)).to(dev), prefix)
+            got = draft.cpu().tolist()
+            hits = drafter.hit[:bs].cpu().tolist()
+            for b in range(bs):
+                total += 1
+                if got[b] != ref_rows[b] or hits[b] != ref_hits[b]:
+                    bad += 1
+                    if bad <= 5:
+                        _hy(f"FAIL kernel W={W} trial={trial} b={b} n={len(seqs[b])} got={got[b]} ref={ref_rows[b]} hit={hits[b]}/{ref_hits[b]}")
+        _hy(f"kernel vs reference W={W} nch={drafter.nch}: rows={total} mismatches={bad}")
+    n_hit = sum(ref_hits)
+    _hy(f"last batch: rows with a lookup hit {n_hit}/{len(ref_hits)}")
+    return bad == 0
+
+
+def _hy_test_record(hd, dev):
+    rng = _hy_np.random.default_rng(5)
+    B = 8
+    drafter = hd.HybridDrafter(16, 512, B, dev, min_match=4)
+    bs = 6
+    slots = torch.tensor([3, 1, 5, 2, 9, 4], dtype=torch.int64, device=dev)
+    prefix = torch.tensor([10, 0, 100, 5, 7, 300], dtype=torch.int64, device=dev)
+    out = torch.from_numpy(rng.integers(1, 1000, size=(bs, B)).astype(_hy_np.int64)).to(dev)
+    commit = torch.tensor([1, 8, 3, 2, 5, 8], dtype=torch.int32, device=dev)
+    drafter.begin_step(bs)
+    drafter.hit[:bs] = torch.tensor([1, 0, 1, 0, 0, 1], dtype=torch.int32, device=dev)
+    drafter.hist.fill_(-5)
+    drafter.record(out, commit, slots, prefix)
+    h = drafter.hist.cpu().numpy()
+    o = out.cpu().numpy()
+    ok = True
+    for b in range(bs):
+        s, p, c = int(slots[b]), int(prefix[b]), int(commit[b])
+        want = h[s].copy()
+        want[:] = -5
+        want[p + 1:p + 1 + c] = o[b, :c]
+        if not (h[s] == want).all():
+            ok = False
+            _hy(f"FAIL record row {b}")
+    st = drafter.stats.cpu().tolist()
+    exp = [3, 3, 1 + 3 + 8, 8 + 2 + 5]
+    if st != exp:
+        ok = False
+        _hy(f"FAIL record stats {st} != {exp}")
+    # positions past the row end are masked
+    drafter.hist.fill_(-5)
+    drafter.record(out[:1], commit[1:2], slots[:1], torch.tensor([drafter.W - 3], dtype=torch.int64, device=dev))
+    ok = ok and (drafter.hist[int(slots[0]), :drafter.W - 3] == -5).all().item() and (drafter.hist[int(slots[0]), drafter.W - 2:] != -5).sum().item() == 2
+    _hy(f"record kernel + stats + end-of-row mask: {'ok' if ok else 'FAIL'}")
+    return ok
+
+
+def _hy_fake_req(rid, slot, tokens):
+    return _hy_types.SimpleNamespace(rid=rid, kv=_hy_types.SimpleNamespace(req_pool_idx=slot), full_untruncated_fill_ids=_hy_array.array("q", [int(t) for t in tokens]))
+
+
+def _hy_test_prefill(hd, dev):
+    rng = _hy_np.random.default_rng(9)
+    drafter = hd.HybridDrafter(8, 4096, 8, dev, min_match=4)
+    a = rng.integers(0, 500, size=900)
+    b = rng.integers(0, 500, size=300)
+    ra, rb = _hy_fake_req("A", 2, a), _hy_fake_req("B", 5, b)
+    ok = True
+    # chunk 1: A[0:400], B[0:300] (B is final); bonus tokens 11 / 22
+    drafter.observe_prefill([ra, rb], [0, 0], [400, 300], torch.tensor([2, 5], device=dev), torch.tensor([400, 300], device=dev), torch.tensor([11, 22], device=dev))
+    h = drafter.hist.cpu().numpy()
+    ok &= (h[2, :400] == a[:400]).all() and h[2, 400] == 11 and (h[5, :300] == b).all() and h[5, 300] == 22
+    # chunk 2 of A only writes the delta: corrupt an early position, it must stay corrupted
+    drafter.hist[2, 7] = -9
+    drafter.observe_prefill([ra], [400], [500], torch.tensor([2], device=dev), torch.tensor([900], device=dev), torch.tensor([33], device=dev))
+    h = drafter.hist.cpu().numpy()
+    ok &= h[2, 7] == -9 and (h[2, 400:900] == a[400:900]).all() and h[2, 900] == 33
+    # another request takes slot 2, then A comes back (retraction): full rewrite, the corruption is repaired
+    rc = _hy_fake_req("C", 2, rng.integers(0, 500, size=50))
+    drafter.observe_prefill([rc], [0], [50], torch.tensor([2], device=dev), torch.tensor([50], device=dev), torch.tensor([44], device=dev))
+    drafter.observe_prefill([ra], [400], [500], torch.tensor([2], device=dev), torch.tensor([900], device=dev), torch.tensor([55], device=dev))
+    h = drafter.hist.cpu().numpy()
+    ok &= (h[2, :900] == a).all() and h[2, 900] == 55
+    _hy(f"prefill history (chunks, delta-only, slot reuse): {'ok' if ok else 'FAIL'}")
+    return bool(ok)
+
+
+def _hy_test_sim(hd, dev):
+    """A decode loop against a periodic 'truth' with a noisy stand-in for DFlash (each draft token right with p=0.45 given the previous ones were right). Counters, graph capture and acceptance with / without the lookup."""
+    rng = _hy_np.random.default_rng(77)
+    nreq, K, B = 8, 7, 8
+    results = {}
+    for use_lookup in (False, True):
+        drafter = hd.HybridDrafter(16, 6000, B, dev, min_match=4)
+        truths = []
+        for r in range(nreq):
+            P = int(rng.integers(5, 60))
+            base = rng.integers(0, 30000, size=P)
+            truths.append(_hy_np.tile(base, 6000 // P + 1)[:6000])
+        prompt = [1500 + 50 * r for r in range(nreq)]
+        slots = list(range(1, nreq + 1))
+        reqs = [_hy_fake_req(f"r{r}", slots[r], truths[r][:prompt[r]]) for r in range(nreq)]
+        drafter.observe_prefill(reqs, [0] * nreq, prompt, torch.tensor(slots, device=dev), torch.tensor(prompt, device=dev), torch.tensor([int(truths[r][prompt[r]]) for r in range(nreq)], device=dev))
+        prefix = _hy_np.array(prompt, dtype=_hy_np.int64)
+        slots_t = torch.tensor(slots, dtype=torch.int64, device=dev)
+        tot_commit, steps, exp = 0, 0, [0, 0, 0, 0]
+        for step in range(60):
+            draft = _hy_np.zeros((nreq, B), dtype=_hy_np.int64)
+            for r in range(nreq):
+                p = int(prefix[r])
+                draft[r, 0] = truths[r][p]
+                ok_chain = True
+                for j in range(1, B):
+                    ok_chain = ok_chain and rng.random() < 0.45
+                    draft[r, j] = truths[r][p + j] if ok_chain else 99999 + j
+            dt = torch.from_numpy(draft).to(dev)
+            pt = torch.from_numpy(prefix).to(dev)
+            drafter.begin_step(nreq)
+            if use_lookup:
+                drafter.merge(dt, slots_t, pt)
+            merged = dt.cpu().numpy()
+            hit = drafter.hit[:nreq].cpu().numpy()
+            out = _hy_np.zeros((nreq, B), dtype=_hy_np.int64)
+            commit = _hy_np.zeros(nreq, dtype=_hy_np.int32)
+            for r in range(nreq):
+                p = int(prefix[r])
+                acc = 0
+                while acc < K and merged[r, 1 + acc] == truths[r][p + 1 + acc]:
+                    acc += 1
+                commit[r] = acc + 1
+                out[r, :acc + 1] = truths[r][p + 1:p + acc + 2]
+                exp[0 if hit[r] else 1] += 1
+                exp[2 if hit[r] else 3] += int(commit[r])
+            drafter.record(torch.from_numpy(out).to(dev), torch.from_numpy(commit).to(dev), slots_t, pt)
+            prefix = prefix + commit
+            tot_commit += int(commit.sum())
+            steps += nreq
+        st = drafter.stats.cpu().tolist()
+        results[use_lookup] = tot_commit / steps
+        good = st == exp
+        _hy(f"sim lookup={use_lookup}: mean tokens/step {tot_commit / steps:.3f}  counters {st} expected {exp} {'ok' if good else 'FAIL'}")
+        if not good:
+            return False
+    _hy(f"sim: periodic context, DFlash stand-in p=0.45 per token: {results[False]:.3f} -> {results[True]:.3f} tokens per step with the lookup")
+    return results[True] >= results[False]
+
+
+def _hy_test_graph(hd, dev):
+    """merge + record under CUDA-graph capture (no host sync) and replay == eager."""
+    rng = _hy_np.random.default_rng(3)
+    B, bs = 8, 16
+    drafter = hd.HybridDrafter(20, 3000, B, dev, min_match=4)
+    slots = torch.arange(1, bs + 1, dtype=torch.int64, device=dev)
+    seqs = [_hy_seq(rng, int(rng.integers(50, 2500)), 6, "rand") for _ in range(bs)]
+    for b, s in enumerate(seqs):
+        drafter.hist[b + 1, :len(s)] = torch.from_numpy(s.astype(_hy_np.int32)).to(dev)
+    prefix = torch.tensor([len(s) - 1 for s in seqs], dtype=torch.int64, device=dev)
+    draft0 = torch.from_numpy(rng.integers(0, 6, size=(bs, B)).astype(_hy_np.int64)).to(dev)
+    commit = torch.full((bs,), 3, dtype=torch.int32, device=dev)
+    out = torch.from_numpy(rng.integers(0, 6, size=(bs, B)).astype(_hy_np.int64)).to(dev)
+    draft = draft0.clone()
+
+    def step():
+        drafter.begin_step(bs)
+        drafter.merge(draft, slots, prefix)
+        drafter.record(out, commit, slots, prefix)
+
+    step()
+    torch.cuda.synchronize()
+    eager_draft, eager_hist = draft.clone(), drafter.hist.clone()
+    draft.copy_(draft0)
+    drafter.hist.zero_()
+    for b, s in enumerate(seqs):
+        drafter.hist[b + 1, :len(s)] = torch.from_numpy(s.astype(_hy_np.int32)).to(dev)
+    g = torch.cuda.CUDAGraph()
+    s2 = torch.cuda.Stream()
+    s2.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s2):
+        step()
+    torch.cuda.current_stream().wait_stream(s2)
+    draft.copy_(draft0)
+    drafter.hist.zero_()
+    for b, s in enumerate(seqs):
+        drafter.hist[b + 1, :len(s)] = torch.from_numpy(s.astype(_hy_np.int32)).to(dev)
+    with torch.cuda.graph(g):
+        step()
+    draft.copy_(draft0)
+    drafter.hist.zero_()
+    for b, s in enumerate(seqs):
+        drafter.hist[b + 1, :len(s)] = torch.from_numpy(s.astype(_hy_np.int32)).to(dev)
+    g.replay()
+    torch.cuda.synchronize()
+    ok = bool((draft == eager_draft).all()) and bool((drafter.hist == eager_hist).all())
+    _hy(f"CUDA-graph capture + replay of begin_step/merge/record == eager: {'ok' if ok else 'FAIL'}")
+    # timing, inside graph replay (bs 32, long history)
+    d2 = hd.HybridDrafter(40, 131072, B, dev, min_match=4)
+    sl = torch.arange(1, 33, dtype=torch.int64, device=dev)
+    for b in range(32):
+        d2.hist[b + 1, :60000] = torch.from_numpy(rng.integers(0, 3000, size=60000).astype(_hy_np.int32)).to(dev)
+    pre = torch.full((32,), 59999, dtype=torch.int64, device=dev)
+    dr = torch.zeros((32, B), dtype=torch.int64, device=dev)
+
+    def st2():
+        d2.merge(dr, sl, pre)
+
+    st2()
+    torch.cuda.synchronize()
+    g2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g2):
+        st2()
+    for _ in range(5):
+        g2.replay()
+    a, b_ = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    a.record()
+    for _ in range(50):
+        g2.replay()
+    b_.record()
+    torch.cuda.synchronize()
+    _hy(f"merge cost (bs 32, 60000-token histories, W=131088), graph replay: {a.elapsed_time(b_) * 1000 / 50:.1f} us per step")
+    return ok
+
+
+def prepare(weights):
+    state = _prepare_base(weights)
+    dev = next(iter(weights.values())).device
+    res = {}
+    try:
+        hd = _hy_load()
+        _hy("module loaded")
+        for name, fn in (("kernels", _hy_test_kernels), ("record", _hy_test_record), ("prefill", _hy_test_prefill), ("sim", _hy_test_sim), ("graph", _hy_test_graph)):
+            try:
+                res[name] = bool(fn(hd, dev))
+            except Exception as ex:  # noqa: BLE001
+                res[name] = False
+                _hy(f"FAIL {name}: {type(ex).__name__}: {str(ex)[:200]} || " + " | ".join(_hy_tb.format_exc().strip().splitlines()[-4:])[-500:])
+    except Exception as ex:  # noqa: BLE001
+        _hy(f"FAIL load: {type(ex).__name__}: {str(ex)[:200]}")
+    _hy("SUMMARY " + " ".join(f"{k}={'PASS' if v else 'FAIL'}" for k, v in res.items()))
+    return state
