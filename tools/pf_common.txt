@@ -8,7 +8,6 @@ import base64 as _pf_b64
 import importlib as _pf_il
 import importlib.util as _pf_ilu
 import os as _pf_os
-import sys as _pf_sys
 import tempfile as _pf_tmp
 import traceback as _pf_trace
 import types as _pf_types
@@ -43,31 +42,21 @@ def _pf_stage(label, fn, *args):
         return None
 
 
-def _pf_load(name, text):
-    """Exec the patched text as module `name` (the installed module's name); the installed one is kept if the exec fails."""
-    path = _pf_os.path.join(_PF_DIR, name.replace(".", "_") + ".py")
-    with open(path, "w") as f:
-        f.write(text)
-    parent, _, leaf = name.rpartition(".")
-    pmod = _pf_il.import_module(parent)
-    spec = _pf_ilu.spec_from_file_location(name, path)
-    mod = _pf_ilu.module_from_spec(spec)
-    old = _pf_sys.modules.get(name)
-    _pf_sys.modules[name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except BaseException:
-        if old is not None:
-            _pf_sys.modules[name] = old
-        else:
-            _pf_sys.modules.pop(name, None)
-        raise
-    setattr(pmod, leaf, mod)
-    return mod
+def _pf_flag(name):
+    """The patched env flags (default on) read straight from the environment: the installed Envs class is not touched."""
+    return _pf_os.environ.get(name, "1").lower() not in ("0", "false", "no", "n")
 
 
-def _pf_load_classes(name, text, names):
-    """Fallback when a whole-module exec fails: exec only the patched classes in a copy of the installed module's globals."""
+def _pf_exec(name, text, inject=None):
+    """Exec the patched text in a FRESH namespace (nothing already loaded is replaced or modified). Returns the namespace dict."""
+    ns = {"__name__": name, "__file__": name + ".py"}
+    ns.update(inject or {})
+    exec(compile(text, name + "(patched)", "exec"), ns)
+    return ns
+
+
+def _pf_exec_classes(name, text, names):
+    """Fallback when a whole-module exec fails: exec only the patched classes in a COPY of the installed module's globals."""
     import __future__
 
     inst = _pf_il.import_module(name)
@@ -75,20 +64,23 @@ def _pf_load_classes(name, text, names):
     tree = _pf_ast.parse(text)
     body = [n for n in tree.body if isinstance(n, _pf_ast.ClassDef) and n.name in names]
     exec(compile(_pf_ast.Module(body=body, type_ignores=[]), name + "(patched)", "exec", flags=__future__.annotations.compiler_flag), g)
-    return _pf_types.SimpleNamespace(**{n: g[n] for n in names}, __name__=name)
+    return g
 
 
-def _pf_env():
-    from sglang.srt import environ as E
+def _pf_log_capture(prefix):
+    import logging
 
-    added = []
-    for nm in ("SGLANG_MUSE_MK_MOE", "SGLANG_MUSE_PROJ_MK"):
-        if not hasattr(E.Envs, nm):
-            f = E.EnvBool(True)
-            f.name = nm
-            setattr(E.Envs, nm, f)
-            added.append(nm)
-    _pf(f"env fields added to the installed Envs (as the patched environ.py defines them): {added}; values now {[getattr(E.envs, n).get() for n in ('SGLANG_MUSE_MK_MOE', 'SGLANG_MUSE_PROJ_MK')]}")
+    class _H(logging.Handler):
+        def emit(self, rec):
+            msg = rec.getMessage()[:240]
+            if rec.exc_info:
+                msg += " || " + " | ".join(l.strip() for l in _pf_trace.format_exception(*rec.exc_info)[-2:])[-400:]
+            _pf(f"LOG {prefix} {rec.levelname}: {msg}")
+
+    h = _H()
+    h.setLevel(logging.INFO)
+    logging.getLogger().addHandler(h)
+    return h
 
 
 def _pf_base_check(expected):
