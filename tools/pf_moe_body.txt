@@ -1,11 +1,22 @@
 
 
-def _pf_route(m, dev, seed):
+def _pf_route(m, dev, seed, stress=False):
+    """stress: every route of every token on the 32 local experts (8x the real local load, numerics only).
+    Otherwise: Zipf-like expert popularity (exponent 0.9, fixed random expert order) sampled without replacement (Gumbel top-8):
+    about M local routes in total with a hot expert, like the measured serving routing."""
     g = torch.Generator(device=dev)
     g.manual_seed(seed)
-    u = torch.rand(m, 256, device=dev, generator=g)
-    u[:, :32] *= 4.0  # skew toward this GPU's 32 local experts (about 2.9 local routes per token)
-    ids = u.topk(8, dim=1).indices.to(torch.int32)
+    if stress:
+        u = torch.rand(m, 256, device=dev, generator=g)
+        u[:, :32] *= 4.0
+        ids = u.topk(8, dim=1).indices.to(torch.int32)
+    else:
+        gp = torch.Generator(device=dev)
+        gp.manual_seed(77)
+        rank = torch.randperm(256, device=dev, generator=gp).float()
+        logp = -0.9 * torch.log(rank + 1.0)
+        gum = -torch.log(-torch.log(torch.rand(m, 256, device=dev, generator=g).clamp_min(1e-9)).clamp_min(1e-9))
+        ids = (logp[None, :] + gum).topk(8, dim=1).indices.to(torch.int32)
     sc = torch.softmax(torch.randn(m, 8, device=dev, generator=g), dim=1).float()
     x = torch.randn(m, 4096, device=dev, generator=g).to(torch.bfloat16)
     return x, sc, ids
@@ -166,8 +177,8 @@ def _pf_moe(weights, state):
             layer._mk_moe = saved
 
     cfg_local = {"local_start": 0, "local_count": 32}
-    for m in (1, 8, 32, 128, 256, 257):
-        x, sc, ids = _pf_route(m, dev, 100 + m)
+    for m, stress in ((1, False), (8, False), (32, False), (128, False), (256, False), (257, False), (128, True), (256, True)):
+        x, sc, ids = _pf_route(m, dev, 100 + m, stress)
         calls["n"] = 0
         out = fwd(x, sc, ids, True)
         torch.cuda.synchronize()
@@ -177,9 +188,26 @@ def _pf_moe(weights, state):
         data = {"hidden_states": x, "topk_ids": ids, "topk_weights": sc, "config": {**cfg_local, "bs": m}}
         p1 = _kernel_sglang(data, state)
         p1mk = kernel_fn(data, state)
-        nloc = int(((ids >= 0) & (ids < 32)).sum())
-        _pf(f"MOE M={m} local_routes={nloc} mk_calls={used} out={tuple(out.shape)} {out.dtype} rel(patched,stock_fwd)={_pf_rel(out, ref):.2e} rel(stock_fwd,phase1_marlin)={_pf_rel(ref, p1):.2e} "
+        loc = ids[(ids >= 0) & (ids < 32)].long()
+        nloc = int(loc.numel())
+        hot = int(torch.bincount(loc, minlength=32).max()) if nloc else 0
+        _pf(f"MOE{' STRESS' if stress else ''} M={m} local_routes={nloc} hot_expert={hot} mk_calls={used} out={tuple(out.shape)} {out.dtype} rel(patched,stock_fwd)={_pf_rel(out, ref):.2e} rel(stock_fwd,phase1_marlin)={_pf_rel(ref, p1):.2e} "
             f"det={bool(torch.equal(out, out2))} bitwise(patched,phase1_MK)={bool(torch.equal(out, p1mk))} finite={bool(torch.isfinite(out.float()).all())}")
+
+    # the standard norm form (weight_first False): rms_norm(y) * w
+    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm as StdNorm
+
+    norm_std = StdNorm(4096, eps=1e-8)
+    norm_std.weight = nn.Parameter(weights["post_norm_w"].float().clone() + 1.0, requires_grad=False)
+    norm_std.to(dev)
+    x, sc, ids = _pf_route(32, dev, 321)
+    o_mk = layer._forward_marlin(x, sc, ids, norm_std)
+    sv = layer._mk_moe
+    layer._mk_moe = None
+    o_st = layer._forward_marlin(x, sc, ids, norm_std)
+    layer._mk_moe = sv
+    _pf(f"MOE standard norm form (weight_first={layer._post_expert_norm_weight_first}) M=32 rel(patched,stock_fwd)={_pf_rel(o_mk, o_st):.2e}")
+    layer._forward_marlin(x, sc, ids, norm)  # back to the weight-first norm for the rest
 
     # a second layer with a different up/gate global scale ratio (Marlin collapses to the gate column; the post-norm cancels the gain)
     layer_b = _pf_stage("second layer r_up=1.7", _pf_make_layer, fpmod, nvmod, weights, state, 1.7, dev)
@@ -216,12 +244,30 @@ def _pf_moe(weights, state):
             _pf(f"MOE graph M={m} capture ok, replay bitwise==eager: {bool(torch.equal(gout, eager))}")
         _pf_stage(f"graph M={m}", cap)
 
-    # timing (eager, CUDA events): patched MK path vs stock Marlin path of the same layer
-    for m in (8, 32, 128, 256):
-        x, sc, ids = _pf_route(m, dev, 700 + m)
-        t_mk = _pf_events(lambda: fwd(x, sc, ids, True))
-        t_st = _pf_events(lambda: fwd(x, sc, ids, False))
-        _pf(f"MOE time M={m}: patched {t_mk:.1f} us, stock {t_st:.1f} us (eager launches, cached L2)")
+    # timing: CUDA-graph replays of the patched path and of the layer's stock Marlin path, same inputs, realistic routing, L2 not flushed
+    def graph_of(use_mk, x, sc, ids):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                fwd(x, sc, ids, use_mk)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr):
+            fwd(x, sc, ids, use_mk)
+        return gr
+
+    for m in (1, 8, 32, 128, 256):
+        def tm(m=m):
+            x, sc, ids = _pf_route(m, dev, 700 + m)
+            g1 = graph_of(True, x, sc, ids)
+            g0 = graph_of(False, x, sc, ids)
+            t_mk = _pf_events(g1.replay, iters=50, warm=10)
+            t_st = _pf_events(g0.replay, iters=50, warm=10)
+            loc = ids[(ids >= 0) & (ids < 32)]
+            _pf(f"MOE graph-replay time M={m} (local_routes={int(loc.numel())}): patched {t_mk:.1f} us, stock Marlin {t_st:.1f} us")
+        _pf_stage(f"timing M={m}", tm)
     mk.forward = orig_fwd
 
 
