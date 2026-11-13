@@ -1,6 +1,6 @@
 """Port the MK MoE + projection + hybrid-draft hooks onto SGLang v0.5.23 (297e54fd) in serve2/sglang.
 
-usage: port_patch_v0523.py <full_hybrid|full|moe_only>
+usage: port_patch_v0523.py <full_hybrid|full|moe_only|moe_hybrid>
 Every anchor must match exactly once or the script exits non-zero before anything is written.
 Our modules are copied byte-identical from serve/sglang-a55ab7d5 (hash-checked against the old patch blobs).
 """
@@ -13,7 +13,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SG = ROOT / "serve2" / "sglang" / "python" / "sglang" / "srt"
 OLD = ROOT / "serve" / "sglang-a55ab7d5" / "python" / "sglang" / "srt"
 variant = sys.argv[1]
-assert variant in ("full_hybrid", "full", "moe_only")
+assert variant in ("full_hybrid", "full", "moe_only", "moe_hybrid")
+PROJ_OFF = variant in ("moe_only", "moe_hybrid")
+HYBRID = variant in ("full_hybrid", "moe_hybrid")
 
 MODULES = {  # path -> git blob hash (identical in all three old diffs)
     "layers/moe/muse_mk_moe.py": "296aee8ebce3e366416b18249cf3d906292951a5",
@@ -34,8 +36,8 @@ env_new = env_old + (
     "    SGLANG_MUSE_MK_MOE = EnvBool(True)\n"
     "    # Serve the dense BF16 projections (qkv_proj, o_proj, pooler, router) of up to 256 tokens with the public compressed-weight kernels (layers/muse_proj_mk.py); off = stock.\n"
     "    SGLANG_MUSE_PROJ_MK = EnvBool(%s)%s\n"
-) % (("False", "  # OFF by default in the moe-only variant") if variant == "moe_only" else ("True", ""))
-if variant == "full_hybrid":
+) % (("False", "  # OFF by default in the moe-only variant") if PROJ_OFF else ("True", ""))
+if HYBRID:
     env_new += (
         "    # Prompt-lookup drafts from the request's own tokens, merged into the DFlash block when the suffix match is long enough; off = DFlash drafts only.\n"
         "    SGLANG_MUSE_HYBRID_DRAFT = EnvBool(True)\n"
@@ -194,7 +196,7 @@ edit(M, "                module.experts.prepare_trtllm_weights(module.experts.po
 __all__ = [''')
 
 # ---- DFlash worker (hybrid variant only)
-if variant == "full_hybrid":
+if HYBRID:
     W = "speculative/dflash_worker_v2.py"
     edit(W, "from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2\n",
          "from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2\nfrom sglang.srt.speculative.hybrid_draft import build_hybrid_drafter\n")
@@ -289,7 +291,7 @@ for path, lst in edits.items():
         else:
             text = text.replace(old, new)
     new_text[path] = text
-need = ["layers/moe/muse_mk_moe.py", "layers/muse_proj_mk.py"] + (["speculative/hybrid_draft.py"] if variant == "full_hybrid" else [])
+need = ["layers/moe/muse_mk_moe.py", "layers/muse_proj_mk.py"] + (["speculative/hybrid_draft.py"] if HYBRID else [])
 for m in need:
     data = (OLD / m).read_bytes()
     h = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True).stdout.decode().strip()
