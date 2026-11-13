@@ -246,3 +246,55 @@ Rules: weights stay as stock keeps them (bf16 projections lossless-compressed an
 4. The router fp32 logits differ at 1e-6; a near-tie in the top-8 expert choice could flip (not observed, not tested on real activations).
 5. Shared per-layer counters (`rk` not used; router `gemm` uses a per-layer counter/workspace, `sk2` none): safe if one layer's call never overlaps itself on two streams; the router already runs on a side stream per call but the same layer is not re-entered.
 6. Weight reload / resume would leave the compressed copies stale (bound once at load), like the MoE.
+
+
+# v0.5.23 port (Nov 13): patch rebuilt on 297e54fd (SGLang v0.5.23 release)
+
+Why: the judge now serves SGLang `297e54fd` (v0.5.23); the old diffs (base a55ab7d5) no longer apply. Nothing was run on a GPU here, no `okc serve` command was used.
+Outputs: serve2/patch_full.diff, serve2/patch_full_hybrid.diff, serve2/patch_moe_only.diff (git diff against 297e54fd). Generator: tools/port_patch_v0523.py (asserts every anchor matches exactly once, checks our modules against the old blob hashes).
+
+## Rules and flags: serve/RULES.md (old, git HEAD) vs serve2/RULES.md
+| item | old (a55ab7d5) | v0.5.23 |
+|---|---|---|
+| base | commit a55ab7d5 (dev-muse-spark-open image) | commit 297e54fd, v0.5.23 release; judge image `lmsysorg/sglang@sha256:f832b5c3...` |
+| patch size | 720 KB | **400 KB** (our diffs: 216-233 KB) |
+| added line length | 400 | 400 (unchanged; ours max 346) |
+| files | .py .cu .cuh .h .hpp .c .cc .cpp .json under python/sglang/, no model_loader | "source files and JSON configs under python/sglang/", nothing under srt/model_loader/, no renames/binary; **readable source: nothing compressed, encoded or obfuscated** (new) |
+| precision/model rules | explicit list (8 experts, 2048 window, every norm, BF16 stays BF16, FP8 KV stays FP8, DFlash drafter unchanged, other drafting only from the request: prompt lookup / n-grams) | replaced by: lossless ("no lower precision, approximations or skipped work beyond stock"), outputs agree with stock and every request returns exactly the tokens it asks for, **at most +2 GB GPU memory per GPU at peak vs stock** (new; each 0.01 of --mem-fraction-static ~1.4 GB), TTFT <= 2x stock, "write it like an SGLang pull request: nothing special-cased to the workload or load levels, nothing that breaks other models or GPUs" (new) |
+| runs | 1 scored + 3 check per day | same; check = ~25 min at 16 users, `--users 1/4/16/32`; sampled greedily (temperature 0); refused patch/flag (422) costs no run, a crashed server does |
+| score | not in the old file | per load: tokens/s/GPU at stock's per-user speed / stock; geometric mean over the 4 loads |
+| launch flags | fixed list in RULES | now a `flags` file you can edit (or `--flag` on check/submit) |
+
+serve2/flags vs the old judge command: new defaults `--speculative-draft-attention-backend fa4`, `--mm-feature-transport cpu`, `--hicache-size 160` (old command had `--enable-hierarchical-cache` without size). Editable: tp 8, ep 8, moe-runner-backend marlin, mem-fraction-static 0.85, speculative-algorithm DFLASH, num-draft-tokens 8, draft-attention-backend fa4, mm-feature-transport cpu, enable-hierarchical-cache, hicache-size 160, chunked-prefill-size 16384, random-seed 1234.
+Fixed: model path, draft model, modelopt_fp4, context-length 131072, enable-cache-report, incremental-streaming-output, max-running-requests 32, cuda-graph-max-bs-decode 32. Long refuse list (e.g. --kv-cache-dtype, --quantization*, --speculative-token-map, --speculative-use-rejection-sampling, --enable-tf32-matmul, --load-format).
+serve/flags is byte-identical to serve2/flags (cmp). `--moe-runner-backend marlin` is still the judge default, so the Marlin path we hook is the served one.
+
+## Hook map (old location -> new location) and contract check
+| hook | old | v0.5.23 | verdict |
+|---|---|---|---|
+| MK MoE bind + `_forward_marlin` path | layers/muse_spark_fp4_moe.py | layers/muse_spark/muse_spark_fp4_moe.py | moved; `bind_mk_moe` and the MK branch re-anchored. `expert_tp` was removed upstream, so the `not self.expert_tp` guard is dropped. Fields used (num_local_experts, hidden_size, intermediate_size_per_partition, top_k, local_expert_offset, use_marlin, _post_expert_norm_weight/_eps/_weight_first) all still exist. `_forward_marlin` still ends in `fused_post_expert_norm_weighted_sum(..., slot_expert_ids=...)` for the weight-first norm |
+| Marlin weight prep | layers/quantization/muse_spark_nvfp4_moe.py | layers/muse_spark/muse_spark_nvfp4_moe.py | moved; same `_process_weights_for_marlin` (alias, `super().process_weights_after_loading`, free natives); `layer.bind_mk_moe()` before `return result` |
+| projections: linear method | layers/quantization/unquant.py `UnquantizedLinearMethod.apply` | same file | same anchor; `_bf16_gemm_dispatch_impl` gained only a contiguity/16-byte-alignment condition on the GEMV route (same maths) |
+| router / pooler / unpooler / bind | models/muse_spark.py | models/muse_spark.py | same structure (`forward_split2`, `bf16_gemm_dispatch` in `_reduce_and_unpool` and in the pooler branch, `post_load_weights`). New: `MuseSpark1xRouter.forward` has a CuTe GEMV route (`router_gemv_cute`) but the served split2 path still goes through `forward_split2`, where our hook is |
+| hybrid drafting | speculative/dflash_worker_v2.py | same file, much refactored (draft_parallel_layout, selector warm-up, dp gather) | 4 call sites + `_init_hybrid_draft` re-anchored (`init_cuda_graphs` tail, prefill return, after `draft_tokens[:, 1:].copy_`, before `SpeculativeSamplingMaskCapture`); `self.model_runner`, `batch.prefix_lens/extend_lens/req_pool_indices/seq_lens`, `prefix_lens`, `commit_lens`, `out_tokens`, `_selector_sample` all still there |
+| Envs fields | environ.py after SGLANG_MUSE_FLYDSL_DECODE | environ.py after SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION (the old anchor is gone) | re-anchored; same 2 (4 with hybrid) fields |
+
+## Marlin layout check (our MoE kernel reads it): UNCHANGED
+Byte-for-byte identical between a55ab7d5 and 297e54fd (diff empty): `gptq_marlin_repack.cuh`, `kernels/ops/quantization/gptq_marlin_repack.py`, `marlin/dequant.h`, `quantization/marlin_utils.py` (permutations, `marlin_permute_scales`).
+`marlin_utils_fp4.py`: only `prepare_moe_nvfp4_layer_for_marlin(layer, group_size=None)` gained an optional argument (compressed-tensors callers); the default path (modelopt, group_size 16) does the same repack, `nvfp4_marlin_process_scales` untouched. The ModelOpt call site (`prepare_moe_nvfp4_layer_for_marlin(layer)` after the w13_weight_scale_2 collapse) is unchanged.
+The Marlin MoE kernel (`marlin_moe/marlin_template.h`, `moe_wna16_marlin.cuh`, `ops/moe/moe_wna16_marlin.py`) did change, but the changes are routing-side: sorted expert ids, inactive-prefix blocks, zeroing of inactive output rows (`expert_ids_are_sorted`, `has_inactive_prefix_count`); no line in the template diff touches scales, dequant or B fragments. The tensors the MK kernel reads (w13/w2 int32 tiles, fp8 scales, bf16 global scale) are the same.
+No stop condition was hit. This is a static diff reading, not a GPU run: the layout validation (rel L2 2.0e-3 vs torch dequant) was not re-run on 0.5.23.
+
+## What changed in the stock MoE path that touches our numerics (read, not measured)
+1. Stock `_marlin_expert_outputs` now maps ids with `_map_topk_ids_to_local_experts` and passes `slot_expert_ids` to the epilogue; inactive (non-local) slots are skipped, as before and as MK does (ids outside [offset, offset+local) are dropped).
+2. `fused_post_expert_norm_weighted_sum` (now kernels/ops/moe/muse_spark_post_expert_finalize_triton.py): same accumulation (fp32, ascending slot); it always runs the Triton kernel when `slot_expert_ids` is given (before, tokens < threshold used a torch fallback). The new `round_product` option is only used by the no-post-norm fallback, not by the weight-first path.
+3. Marlin GEMMs now run with sorted/inactive-prefix routing metadata; the arithmetic per expert is the same, so our MKNUM parity tables (job 53b3070...) should still hold, but they were measured against the old stock call sequence.
+
+## Differences from the old patch
+- Patch size limit is 400 KB: full 215,747 B, full_hybrid 232,794 B, moe_only 215,790 B (all < 409,600).
+- The hybrid variant is the only one that touches dflash_worker_v2.py; full and moe_only do not.
+- Memory rule (+2 GB/GPU at peak vs stock): the projection module takes 6.73 GB extra per GPU (v4 report, from the code path, not measured in serving) -> **full and full_hybrid very likely break the +2 GB rule**; moe_only ships the module but keeps it off (SGLANG_MUSE_PROJ_MK default False). The MoE path adds ~176 MB scratch per device. Recommendation: submit moe_only (or shrink the projection table) unless a check shows the peak delta is below 2 GB.
+- Generic-code rule ("nothing special-cased to the workload or load levels"): MK MoE serves M <= 256 and 32 local experts, hidden/intermediate 4096, top-8 only; other shapes fall back to stock.
+
+## Checks run
+tools/check_patch_rules.py (updated: 400 KB limit, encoded-blob heuristic): RULES OK for all three. `py_compile` ok for all 9 changed files. `git apply --check` ok for all three on a clean `git archive 297e54fd` export. Modules are byte-identical to the old ones (git blob hashes 296aee8e, 946fa587, b6bb41f8). Nothing was imported or run: no torch or GPU in this shell.

@@ -1,4 +1,5 @@
-"""Check serve/patch.diff against serve/RULES.md patch rules."""
+"""Check a patch diff against the serving rules (serve2/RULES.md, v0.5.23: at most 400 KB, no added line over 400 chars, python/sglang/ only,
+not srt/model_loader/, source/JSON only, no renames or binary changes, readable source)."""
 import re
 import sys
 
@@ -32,9 +33,13 @@ print("added lines:", len(added), "longest added line:", longest)
 if longest > 400:
     fail("added line over 400 chars")
 size = len(d.encode())
-print("diff bytes:", size, "(limit 737280)")
-if size > 720 * 1024:
-    fail("diff over 720 KB")
+print("diff bytes:", size, "(limit 409600)")
+if size > 400 * 1024:
+    fail("diff over 400 KB")
+blobs = [l for l in added if any(len(t) > 200 for t in l.split())]
+print("added lines with a 200+ char unbroken token (encoded-blob heuristic):", len(blobs))
+if blobs:
+    fail("possible encoded blob")
 print("non-ascii added lines:", sum(1 for l in added if any(ord(c) > 127 for c in l)))
 print("RULES OK" if ok else "RULES FAILED")
 sys.exit(0 if ok else 1)
