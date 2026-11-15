@@ -461,3 +461,11 @@ Expect: all five PASS (HYB SUMMARY line); kernel mismatches 0; sim tokens/step a
 Decisions: any FAIL -> fix the module (regenerate, rerun; second of at most 3 checks); all PASS -> build patch_full_hybrid.diff, rules check, report. Merge cost above ~300 us -> shrink CAP or split the scan (it adds to every decode step) before shipping default-on.
 RESULT hybrid check 1, job 3b892751442f4602 (muse_bf16_proj; 38 of 40 checks left on that problem, 1 of 3 hybrid checks used): accepted, tests 9/9 (phase-1 timing of sub_v1, 1.173x, not a score). HYB SUMMARY kernels=PASS record=PASS prefill=PASS sim=PASS graph=PASS. Kernel vs python reference: 0 mismatches in 288 rows (W 8208 / 131088). Decode simulation (periodic text, DFlash stand-in p=0.45 per token): 1.831 -> 8.000 tokens/step with the lookup, counters equal host-recomputed [480,0,3840,0] / [0,480,0,879]. Graph capture+replay == eager. merge cost 54.6 us per step (bs 32, 60000-token histories, graph replay) vs the expected 20-150 us. (The sim ceiling is synthetic, not an estimate of real gain.)
 Decision: no bug found, no second check. Built serve/patch_full_hybrid.diff (233,158 bytes, RULES OK, applies clean to a55ab7d5, py_compile OK); risks in PREFLIGHT_REPORT.md.
+
+## Serving track, first scored runs (SGLang v0.5.23)
+| job | patch | result | per load (tok/s/GPU, accept) |
+|---|---|---|---|
+| c5cb32aa25de4443 | patch_moe_only | timed out after 2 h with no rung completed; refunded | - |
+| bf6b90058bd745cb | patch_moe_only | passed, 1.042x | c1 6,620 / 3.90; c4 10,164 / 3.90; c16 12,864 / 4.00; c32 13,390 / 4.20 |
+| 45fa9f3a932e4f62 | patch_moe_hybrid | passed, 1.031x | c1 6,480 / 3.80; c4 10,100 / 3.90; c16 12,897 / 4.00; c32 13,365 / 4.20 |
+Reading: outputs agree with stock (both passed). Prompt-lookup drafting did not change accepted tokens per step (3.8-4.2 in both), so it either rarely matches on this workload or is not active; check the startup log (okc serve status <job> --log) for the hybrid bind line. Accepted ~3.9 of 8 draft tokens: acceptance is the next lever.
