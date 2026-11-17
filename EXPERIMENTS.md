@@ -469,3 +469,11 @@ Decision: no bug found, no second check. Built serve/patch_full_hybrid.diff (233
 | bf6b90058bd745cb | patch_moe_only | passed, 1.042x | c1 6,620 / 3.90; c4 10,164 / 3.90; c16 12,864 / 4.00; c32 13,390 / 4.20 |
 | 45fa9f3a932e4f62 | patch_moe_hybrid | passed, 1.031x | c1 6,480 / 3.80; c4 10,100 / 3.90; c16 12,897 / 4.00; c32 13,365 / 4.20 |
 Reading: outputs agree with stock (both passed). Prompt-lookup drafting did not change accepted tokens per step (3.8-4.2 in both), so it either rarely matches on this workload or is not active; check the startup log (okc serve status <job> --log) for the hybrid bind line. Accepted ~3.9 of 8 draft tokens: acceptance is the next lever.
+
+## Serving track, draft-token count sweep (patch_moe_only)
+| job | draft tokens | score | accept per load (c1/c4/c16/c32) |
+|---|---|---|---|
+| bf6b90058bd745cb | 8 (default) | 1.042x | 3.9 / 3.9 / 4.0 / 4.2 |
+| 3b5ce705e25f47d6 | 7 | 1.034x | 3.9 / 3.7 / 3.9 / 3.9 |
+| 9b49c68edb7249c6 | 6 | 1.038x | 3.8 / 3.5 / 3.6 / 3.8 |
+Reading: all within run-to-run spread (up to 5.7% at c1). The DFlash2 drafter is trained with block size 8 and SGLang allows 1-8, so the draft length is not a lever; keep the default 8. Note: resubmitting an identical patch is rejected as duplicate (757cba1486da4723) and wastes the day.
