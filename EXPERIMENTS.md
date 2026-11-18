@@ -477,3 +477,9 @@ Reading: outputs agree with stock (both passed). Prompt-lookup drafting did not 
 | 3b5ce705e25f47d6 | 7 | 1.034x | 3.9 / 3.7 / 3.9 / 3.9 |
 | 9b49c68edb7249c6 | 6 | 1.038x | 3.8 / 3.5 / 3.6 / 3.8 |
 Reading: all within run-to-run spread (up to 5.7% at c1). The DFlash2 drafter is trained with block size 8 and SGLang allows 1-8, so the draft length is not a lever; keep the default 8. Note: resubmitting an identical patch is rejected as duplicate (757cba1486da4723) and wastes the day.
+
+## Serving track, MoE plus router projection (patch_moe_router)
+| job | patch | score | notes |
+|---|---|---|---|
+| 5b9164cb95f942a6 | patch_moe_router | 1.054x (best) | weight memory 69.85 -> 71.84 GB per GPU (+1.99 GB, at the 2 GB limit); accept 4.1 / 3.9 / 4.0 / 4.1 |
+Reading: the router projection adds about 1.2% over MoE alone. No memory is left for more projection kinds. RULES.md does not say whether the best or the last scored run counts, and does not say that lowering --mem-fraction-static frees budget, so the last run re-scores this build instead of trading KV cache for more projections.
