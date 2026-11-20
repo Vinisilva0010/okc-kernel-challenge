@@ -483,3 +483,10 @@ Reading: all within run-to-run spread (up to 5.7% at c1). The DFlash2 drafter is
 |---|---|---|---|
 | 5b9164cb95f942a6 | patch_moe_router | 1.054x (best) | weight memory 69.85 -> 71.84 GB per GPU (+1.99 GB, at the 2 GB limit); accept 4.1 / 3.9 / 4.0 / 4.1 |
 Reading: the router projection adds about 1.2% over MoE alone. No memory is left for more projection kinds. RULES.md does not say whether the best or the last scored run counts, and does not say that lowering --mem-fraction-static frees budget, so the last run re-scores this build instead of trading KV cache for more projections.
+
+## Serving track, final runs
+| job | build | score | notes |
+|---|---|---|---|
+| d1c311fd7f9c45d2 | patch_moe_router, draft tokens 8 explicit | 1.045x | same build as 5b9164cb (1.054x): about 1% run-to-run spread |
+| 4e7a31a44c64456d | patch_moe_router, --random-seed 4321 | pending | last submission, sent 7.5 h before close; may not run before the track ends |
+Best scored run: 5b9164cb95f942a6, 1.054x (MK MoE plus router projection kernels).
