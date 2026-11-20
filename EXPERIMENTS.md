@@ -488,5 +488,5 @@ Reading: the router projection adds about 1.2% over MoE alone. No memory is left
 | job | build | score | notes |
 |---|---|---|---|
 | d1c311fd7f9c45d2 | patch_moe_router, draft tokens 8 explicit | 1.045x | same build as 5b9164cb (1.054x): about 1% run-to-run spread |
-| 4e7a31a44c64456d | patch_moe_router, --random-seed 4321 | pending | last submission, sent 7.5 h before close; may not run before the track ends |
-Best scored run: 5b9164cb95f942a6, 1.054x (MK MoE plus router projection kernels).
+| 4e7a31a44c64456d | patch_moe_router, --random-seed 4321 | 1.055x (best and last) | ran before the close; c1 6,671 / c4 10,320 / c16 13,076 / c32 13,518 tok/s/GPU |
+Best scored run: 4e7a31a44c64456d, 1.055x (MK MoE plus router projection kernels).
